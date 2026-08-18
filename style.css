@@ -44,24 +44,36 @@ html, body {
 
 body {
   font-family: var(--font-body);
-  background: linear-gradient(180deg, #f3f6fb 0%, #e9edf5 100%);
+  background: linear-gradient(160deg, #dbe7fa 0%, #e8e6f7 35%, #dfeaf8 70%, #d3e3f7 100%);
   background-attachment: fixed;
   color: var(--color-fg);
   -webkit-font-smoothing: antialiased;
 }
 
-/* Fundo "aurora" animado */
+/* Blobs coloridos desfocados (efeito vidro moderno) */
 body::before {
   content: '';
   position: fixed;
-  inset: -10%;
+  inset: -15%;
   z-index: 0;
   pointer-events: none;
   background:
-    radial-gradient(620px circle at 12% -5%, rgba(91,155,248,.14), transparent 55%),
-    radial-gradient(720px circle at 92% 8%, rgba(143,192,251,.16), transparent 55%),
-    radial-gradient(680px circle at 50% 110%, rgba(186,214,252,.18), transparent 55%);
+    radial-gradient(560px circle at 15% 5%, rgba(91,155,248,.55), transparent 62%),
+    radial-gradient(640px circle at 88% 12%, rgba(167,139,250,.45), transparent 62%),
+    radial-gradient(580px circle at 70% 90%, rgba(103,232,249,.42), transparent 62%),
+    radial-gradient(500px circle at 20% 95%, rgba(244,182,226,.40), transparent 62%);
+  filter: blur(70px) saturate(1.35);
   animation: auroraFloat 18s ease-in-out infinite alternate;
+}
+
+/* Véu opaco em degradê por cima dos blobs, suavizando tudo */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(255,255,255,.34) 0%, rgba(255,255,255,.12) 45%, rgba(230,238,250,.26) 100%);
 }
 
 /* Scrollbar moderna */
@@ -930,6 +942,7 @@ svg { display: block; }
 }
 .compare-filters-note svg { width: 17px; height: 17px; flex-shrink: 0; }
 .compare-table { width: 100%; border-collapse: collapse; }
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .compare-table thead { background: var(--color-muted); }
 .compare-table th {
   padding: .75rem 1.25rem; text-align: left; font-size: .66rem; font-weight: 600;
@@ -1113,15 +1126,78 @@ svg { display: block; }
    Responsive
    ============================================================ */
 @media (max-width: 768px) {
-  .app-header__inner { padding: .85rem 1rem; }
-  .app-main__inner { padding: 1rem; }
-  .app-panel.expanded { width: 250px; }
-  .app-panel__inner { width: 250px; padding: 1rem; }
-  .kpi-card__value { font-size: 1.4rem; }
+  .app-header__inner { padding: .7rem .9rem; }
+  .app-header__title h1 { font-size: 1.15rem; }
+  .app-logo { width: 34px; height: 34px; border-radius: 12px; }
+  .app-logo svg { width: 17px; height: 17px; }
+  .app-main__inner { padding: 1rem .85rem 4rem; }
+  .section-title { font-size: 1.05rem; }
+
+  /* Painel de filtros vira overlay para não esmagar o conteúdo */
+  .app-panel {
+    position: fixed;
+    top: 0; left: 56px; bottom: 0;
+    z-index: 45;
+    box-shadow: var(--shadow-lg);
+    border-right: none;
+  }
+  .app-panel.expanded { width: min(300px, calc(100vw - 56px)); }
+  .app-panel__inner { width: min(300px, calc(100vw - 56px)); padding: 1.1rem; }
+
+  .app-sidebar { width: 56px; }
+  .sidebar-btn { width: 40px; height: 40px; }
+
+  /* KPIs: sempre 2 colunas compactas — todos os indicadores visíveis */
+  .kpi-grid { grid-template-columns: repeat(2, 1fr); gap: .6rem; }
+  .kpi-card { padding: .9rem; border-radius: 1.1rem; }
+  .kpi-card__value { font-size: 1.25rem; margin-top: .25rem; }
+  .kpi-card__label { font-size: .68rem; }
+  .kpi-card__icon { padding: .45rem; }
+  .kpi-card__icon svg { width: 16px; height: 16px; }
+  .kpi-card__cta { display: none; }
+
+  .charts-grid { gap: .85rem; }
+  .chart-card { padding: 1rem; }
+  .chart-card h3 { font-size: .88rem; }
+  .chart-card canvas { max-height: 240px; }
+
+  .tabs { gap: .15rem; padding: .3rem; }
   .tab-trigger span { display: none; }
-  .tab-trigger { padding: .55rem .7rem; }
+  .tab-trigger { padding: .55rem .75rem; }
+  .tab-trigger svg { width: 18px; height: 18px; }
+
+  .cards-grid { grid-template-columns: 1fr; }
+  .cards-toolbar { flex-direction: column; align-items: flex-start; }
+
+  .planners-grid { grid-template-columns: 1fr; }
+  .planners-header { flex-direction: column; }
+
+  /* Gantt: coluna de tarefas mais estreita, gráfico rola na horizontal */
+  .gantt-col-label, .gantt-task-label { width: 180px; }
+  .gantt-task-label__body p { font-size: .78rem; }
+  .gantt-badges .badge { font-size: .6rem; padding: .12rem .4rem; }
+  .gantt-details-grid { grid-template-columns: 1fr; }
+  .gantt-legend { gap: .6rem; font-size: .64rem; }
+  .gantt-card__header { padding: 1rem; }
+  .gantt-date-tag { display: none; }
+
+  .compare-table th, .compare-table td { padding: .6rem .75rem; font-size: .74rem; }
+
   .modal-panel { max-width: 100%; }
-  .planner-switcher { max-width: 140px; }
+  .modal-header { padding: 1rem; }
+  .modal-body { padding: 1rem; }
+  .modal-task-item__top h3 { max-width: 12rem; }
+
+  .planner-switcher { max-width: 130px; padding: .4rem .7rem; font-size: .75rem; }
   .sync-status__text { display: none; }
   .sync-status { padding: .32rem .5rem; }
+
+  .dropzone { padding: 1.4rem 1rem; }
+  .mapping-fields { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 400px) {
+  .app-header__badge { display: none; }
+  .kpi-card__value { font-size: 1.1rem; }
+  .gantt-col-label, .gantt-task-label { width: 145px; }
 }
