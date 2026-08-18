@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+  <title>Orquestrador de Tarefas</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <div class="app">
+
+    <!-- Header -->
+    <header class="app-header">
+      <div class="app-header__inner">
+        <div class="app-header__title">
+          <span class="app-logo" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4"/><path d="M12 18v4"/><path d="M4.93 4.93l2.83 2.83"/><path d="M16.24 16.24l2.83 2.83"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M4.93 19.07l2.83-2.83"/><path d="M16.24 7.76l2.83-2.83"/></svg>
+          </span>
+          <h1>Orquestrador de Tarefas</h1>
+          <div class="app-header__badge">
+            <span class="pulse-dot"></span>
+            <span id="taskCounter">0 / 0</span>
+          </div>
+        </div>
+        <div class="app-header__right">
+          <div class="sync-status local" id="syncStatus" title="Status da sincronização com a nuvem">
+            <span class="sync-status__dot"></span>
+            <span class="sync-status__text">Conectando...</span>
+          </div>
+          <select id="plannerSwitcher" class="planner-switcher" title="Alternar planner ativo"></select>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main -->
+    <div class="app-body">
+
+      <!-- Sidebar -->
+      <aside class="app-sidebar">
+        <button class="sidebar-btn" id="btnToggleFilters" title="Filtros">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+        </button>
+      </aside>
+
+      <!-- Painel expansível (Filtros) -->
+      <div class="app-panel" id="expandablePanel">
+        <div class="app-panel__inner" id="panelContent"></div>
+      </div>
+
+      <!-- Área de conteúdo -->
+      <main class="app-main">
+        <div class="app-main__inner">
+
+          <!-- Tabs -->
+          <div class="tabs">
+            <button class="tab-trigger active" data-tab="metrics">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg>
+              <span>Métricas</span>
+            </button>
+            <button class="tab-trigger" data-tab="gantt">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+              <span>Gantt</span>
+            </button>
+            <button class="tab-trigger" data-tab="tasks">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+              <span>Tarefas</span>
+            </button>
+            <button class="tab-trigger" data-tab="planners">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+              <span>Planners</span>
+            </button>
+            <button class="tab-trigger" data-tab="compare">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="18" rx="1"/><rect x="14" y="3" width="7" height="18" rx="1"/></svg>
+              <span>Comparar</span>
+            </button>
+          </div>
+
+          <!-- Tab: Métricas -->
+          <div class="tab-content active" id="tab-metrics">
+            <h2 class="section-title">Visão Geral</h2>
+            <div id="metricsRoot"></div>
+          </div>
+
+          <!-- Tab: Gantt -->
+          <div class="tab-content" id="tab-gantt">
+            <h2 class="section-title">Timeline de Tarefas</h2>
+            <div id="ganttRoot"></div>
+          </div>
+
+          <!-- Tab: Tarefas -->
+          <div class="tab-content" id="tab-tasks">
+            <h2 class="section-title">Lista de Tarefas</h2>
+            <div id="tasksRoot"></div>
+          </div>
+
+          <!-- Tab: Planners -->
+          <div class="tab-content" id="tab-planners">
+            <div id="plannersRoot"></div>
+          </div>
+
+          <!-- Tab: Comparar -->
+          <div class="tab-content" id="tab-compare">
+            <h2 class="section-title">Comparativo entre Planners</h2>
+            <div id="compareRoot"></div>
+          </div>
+
+        </div>
+      </main>
+
+    </div>
+  </div>
+
+  <!-- KPI Detail Modal -->
+  <div class="modal-overlay" id="modalOverlay"></div>
+  <div class="modal-panel" id="modalPanel">
+    <div class="modal-header">
+      <div class="modal-header__info">
+        <span class="modal-header__icon" id="modalIcon"></span>
+        <div>
+          <h2 id="modalTitle"></h2>
+          <p id="modalDescription"></p>
+        </div>
+      </div>
+      <button class="modal-close" id="modalClose">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+
+  <!-- Loading -->
+  <div class="loading-screen" id="loadingScreen">
+    <div class="loading-screen__inner">
+      <div class="spinner"></div>
+      <p class="loading-brand">Orquestrador de Tarefas</p>
+      <p>Carregando tarefas...</p>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+  <script src="firebase-config.js"></script>
+  <script src="data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
