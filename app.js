@@ -32,6 +32,8 @@
     pendingImport: null,   // { fileName, headers, rows, mapping }
     editingPlannerId: null,
     editingPlannerColor: null,
+    editingAdjustmentId: null,
+    editingUserId: null,
   };
 
   let plannerUploadMessage = null;
@@ -112,6 +114,13 @@
     const str = String(value).trim();
     if (!str) return null;
 
+    // yyyy-mm-dd (input type=date) — interpretar como data LOCAL, não UTC
+    const iso = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (iso) {
+      const dt = new Date(+iso[1], +iso[2] - 1, +iso[3]);
+      return isNaN(dt.getTime()) ? null : dt;
+    }
+
     // dd/mm/yyyy ou dd-mm-yyyy (padrão brasileiro)
     const m = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
     if (m) {
@@ -153,6 +162,13 @@
     if (!s || !d) return '—';
     const days = Math.round((d.getTime() - s.getTime()) / 86400000);
     return days >= 0 ? `${days} dia${days !== 1 ? 's' : ''}` : '—';
+  }
+
+  // Diferença em dias inteiros entre duas datas (normalizadas à meia-noite local)
+  function dayDiff(from, to) {
+    const a = new Date(from.getFullYear(), from.getMonth(), from.getDate());
+    const b = new Date(to.getFullYear(), to.getMonth(), to.getDate());
+    return Math.round((b.getTime() - a.getTime()) / 86400000);
   }
 
   /* ============================================================
@@ -228,11 +244,18 @@
   }
 
   /* ============================================================
-     Persistência (localStorage + Firebase)
+     Persistência (localStorage + Firebase) — isolada por usuário:
+     cada usuário enxerga somente os próprios arquivos/planners.
      ============================================================ */
+  function storageKey() {
+    return auth.user ? `${STORAGE_KEY}:${auth.user.id}` : null;
+  }
+
   function writeLocal() {
+    const key = storageKey();
+    if (!key) return; // anônimo não possui espaço de dados
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      localStorage.setItem(key, JSON.stringify({
         planners: state.planners,
         activePlannerId: state.activePlannerId,
       }));
@@ -247,8 +270,10 @@
   }
 
   function loadFromStorage() {
+    const key = storageKey();
+    if (!key) return null;
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = localStorage.getItem(key);
       if (!raw) return null;
       return JSON.parse(raw);
     } catch (e) {
@@ -268,6 +293,7 @@
   const cloud = {
     db: null,
     fingerprints: {},      // plannerId -> hash do que já está na nuvem
+    remoteStamps: {},      // plannerId -> updatedAt visto na nuvem (realtime)
     metaFingerprint: null,
     saveTimer: null,
     saving: false,
@@ -287,6 +313,7 @@
       synced: { text: 'Salvo na nuvem', cls: 'synced' },
       error: { text: 'Erro ao sincronizar', cls: 'error' },
       local: { text: 'Somente local', cls: 'local' },
+      readonly: { text: 'Somente leitura', cls: 'local' },
     };
     const s = map[status] || map.local;
     el.className = 'sync-status ' + s.cls;
@@ -301,7 +328,7 @@
   }
 
   function plannerFingerprint(p) {
-    return simpleHash(JSON.stringify({ n: p.name, c: p.color, a: p.addedAt, t: p.tasks }));
+    return simpleHash(JSON.stringify({ n: p.name, c: p.color, a: p.addedAt, t: p.tasks, j: p.adjustments || [] }));
   }
 
   function chunkTasksJson(tasks) {
@@ -324,6 +351,8 @@
 
   function scheduleCloudSave() {
     if (!cloud.db) return;
+    // Autorização na camada de persistência: perfis sem escrita nunca enviam nada à nuvem
+    if (!can('cloudWrite')) { setSyncStatus('readonly'); return; }
     clearTimeout(cloud.saveTimer);
     setSyncStatus('syncing');
     cloud.saveTimer = setTimeout(saveToCloud, 1200);
@@ -331,15 +360,19 @@
 
   async function saveToCloud() {
     if (!cloud.db) return;
+    if (!can('cloudWrite') || !auth.user) return;
+    cloud.saveTimer = null;
     if (cloud.saving) { cloud.pendingResave = true; return; }
     cloud.saving = true;
     setSyncStatus('syncing');
     try {
       const db = cloud.db;
-      const existing = await db.collection('planners').get();
+      const uid = auth.user.id;
+      // Isolamento: opera SOMENTE sobre os planners do próprio usuário
+      const existing = await db.collection('planners').where('ownerId', '==', uid).get();
       const keepIds = new Set(state.planners.map(p => p.id));
 
-      // Remove da nuvem planners excluídos localmente
+      // Remove da nuvem planners excluídos localmente (apenas os do usuário)
       for (const doc of existing.docs) {
         if (keepIds.has(doc.id)) continue;
         const chunksSnap = await doc.ref.collection('chunks').get();
@@ -352,6 +385,7 @@
 
       // Grava apenas planners novos ou alterados
       for (const p of state.planners) {
+        if (p.ownerId && p.ownerId !== uid) continue; // nunca escreve sobre arquivos de outro usuário
         const fp = plannerFingerprint(p);
         if (cloud.fingerprints[p.id] === fp) continue;
 
@@ -360,6 +394,7 @@
         const prevChunkCount = prevDoc ? (prevDoc.data().chunkCount || 0) : 0;
         const chunks = chunkTasksJson(p.tasks);
 
+        const stamp = new Date().toISOString();
         const batch = db.batch();
         batch.set(ref, {
           name: p.name,
@@ -367,7 +402,13 @@
           addedAt: p.addedAt || null,
           taskCount: p.tasks.length,
           chunkCount: chunks.length,
-          updatedAt: new Date().toISOString(),
+          adjustmentsJson: JSON.stringify(p.adjustments || []),
+          ownerId: uid,
+          ownerUsername: auth.user.username,
+          fileName: p.fileName || p.name,
+          importedBy: p.importedBy || auth.user.fullName || auth.user.username,
+          version: p.version || 1,
+          updatedAt: stamp,
         });
         chunks.forEach((json, i) => batch.set(ref.collection('chunks').doc('c' + i), { json }));
         for (let i = chunks.length; i < prevChunkCount; i++) {
@@ -375,15 +416,7 @@
         }
         await batch.commit();
         cloud.fingerprints[p.id] = fp;
-      }
-
-      // Metadados (planner ativo)
-      if (cloud.metaFingerprint !== state.activePlannerId) {
-        await db.collection('app').doc('meta').set({
-          activePlannerId: state.activePlannerId,
-          updatedAt: new Date().toISOString(),
-        });
-        cloud.metaFingerprint = state.activePlannerId;
+        cloud.remoteStamps[p.id] = stamp; // evita reprocessar o próprio eco do listener
       }
 
       setSyncStatus('synced');
@@ -399,87 +432,628 @@
     }
   }
 
-  async function loadFromCloud() {
+  function plannerFromDoc(doc, chunksSnap) {
+    const d = doc.data();
+    const ordered = chunksSnap.docs.slice().sort((a, b) => parseInt(a.id.slice(1), 10) - parseInt(b.id.slice(1), 10));
+    let tasks = [];
+    ordered.forEach(c => {
+      try { tasks = tasks.concat(JSON.parse(c.data().json || '[]')); } catch (e) {}
+    });
+    let adjustments = [];
+    try { adjustments = JSON.parse(d.adjustmentsJson || '[]'); } catch (e) {}
+    return {
+      id: doc.id,
+      name: d.name || 'Planner',
+      color: d.color || PLANNER_COLORS[0],
+      addedAt: d.addedAt || null,
+      ownerId: d.ownerId || null,
+      ownerUsername: d.ownerUsername || null,
+      fileName: d.fileName || d.name || null,
+      importedBy: d.importedBy || null,
+      version: d.version || 1,
+      tasks: tasks.map(normalizeExistingTask),
+      adjustments: Array.isArray(adjustments) ? adjustments : [],
+    };
+  }
+
+  // Carrega SOMENTE os planners do usuário autenticado
+  async function loadUserPlanners(uid) {
     if (!cloud.db) return null;
-    const db = cloud.db;
-    const [metaSnap, plannersSnap] = await Promise.all([
-      db.collection('app').doc('meta').get(),
-      db.collection('planners').get(),
-    ]);
-    if (plannersSnap.empty) return null;
+    const plannersSnap = await cloud.db.collection('planners').where('ownerId', '==', uid).get();
+    if (plannersSnap.empty) return [];
 
     const planners = [];
     for (const doc of plannersSnap.docs) {
-      const d = doc.data();
+      cloud.remoteStamps[doc.id] = doc.data().updatedAt || '';
       const chunksSnap = await doc.ref.collection('chunks').get();
-      const ordered = chunksSnap.docs.slice().sort((a, b) => parseInt(a.id.slice(1), 10) - parseInt(b.id.slice(1), 10));
-      let tasks = [];
-      ordered.forEach(c => {
-        try { tasks = tasks.concat(JSON.parse(c.data().json || '[]')); } catch (e) {}
-      });
-      planners.push({
-        id: doc.id,
-        name: d.name || 'Planner',
-        color: d.color || PLANNER_COLORS[0],
-        addedAt: d.addedAt || null,
-        tasks: tasks.map(normalizeExistingTask),
-      });
+      planners.push(plannerFromDoc(doc, chunksSnap));
     }
     planners.sort((a, b) => String(a.addedAt || '').localeCompare(String(b.addedAt || '')));
-
-    return { planners, activePlannerId: metaSnap.exists ? metaSnap.data().activePlannerId : null };
+    return planners;
   }
 
-  function makeDefaultPlanner() {
-    const baseTasks = Array.isArray(window.TASKS_DATA) ? window.TASKS_DATA.map(normalizeExistingTask) : [];
-    return { id: genId(), name: 'Planner Principal', tasks: baseTasks, addedAt: new Date().toISOString(), color: PLANNER_COLORS[0] };
+  /* ============================================================
+     Realtime: planners DO USUÁRIO em outras sessões (mesmo usuário em
+     outro computador). Nossos próprios saves são ignorados via remoteStamps.
+     ============================================================ */
+  let plannersUnsub = null;
+  let plannersPollTimer = null;
+
+  function subscribePlanners() {
+    if (plannersUnsub) { try { plannersUnsub(); } catch (e) {} plannersUnsub = null; }
+    clearInterval(plannersPollTimer);
+    if (!cloud.db || !auth.user) return;
+    plannersUnsub = cloud.db.collection('planners').where('ownerId', '==', auth.user.id).onSnapshot(snap => {
+      if (snap.metadata.hasPendingWrites) return;
+      queueRemoteApply();
+    }, err => console.warn('Listener de planners indisponível.', err));
+    // Fallback: redes/proxies que bloqueiam o canal de push do Firestore
+    plannersPollTimer = setInterval(queueRemoteApply, 30000);
   }
 
-  async function initData() {
-    // 1º tenta a nuvem (fonte da verdade); localStorage é cache/fallback
+  let remoteApplyTimer = null;
+  // Com save local em andamento, adia (nunca descarta) a reconciliação remota
+  function queueRemoteApply() {
+    clearTimeout(remoteApplyTimer);
+    if (cloud.saving || cloud.saveTimer) {
+      remoteApplyTimer = setTimeout(queueRemoteApply, 1200);
+      return;
+    }
+    applyRemotePlanners();
+  }
+
+  async function applyRemotePlanners() {
+    if (!cloud.db || !auth.user) return;
+    try {
+      const uid = auth.user.id;
+      const snap = await cloud.db.collection('planners').where('ownerId', '==', uid).get();
+      if (!auth.user || auth.user.id !== uid) return; // usuário trocou durante o fetch
+      if (cloud.saving || cloud.saveTimer) { queueRemoteApply(); return; }
+      const seen = new Set();
+      const changed = [];
+      snap.docs.forEach(doc => {
+        seen.add(doc.id);
+        if (cloud.remoteStamps[doc.id] !== (doc.data().updatedAt || '')) changed.push(doc);
+      });
+      const removedIds = state.planners.filter(p => !seen.has(p.id)).map(p => p.id);
+      if (!changed.length && !removedIds.length) return;
+
+      for (const doc of changed) {
+        const chunksSnap = await doc.ref.collection('chunks').get();
+        const planner = plannerFromDoc(doc, chunksSnap);
+        const idx = state.planners.findIndex(p => p.id === doc.id);
+        if (idx >= 0) state.planners[idx] = planner;
+        else state.planners.push(planner);
+        cloud.remoteStamps[doc.id] = doc.data().updatedAt || '';
+        cloud.fingerprints[doc.id] = plannerFingerprint(planner);
+      }
+      if (removedIds.length) {
+        state.planners = state.planners.filter(p => !removedIds.includes(p.id));
+        removedIds.forEach(id => { delete cloud.remoteStamps[id]; delete cloud.fingerprints[id]; });
+      }
+      if (state.planners.length && !state.planners.find(p => p.id === state.activePlannerId)) {
+        state.activePlannerId = state.planners[0].id;
+      }
+      writeLocal();
+      populatePlannerSwitcher();
+      renderAll();
+    } catch (e) {
+      console.warn('Falha ao aplicar atualização em tempo real.', e);
+    }
+  }
+
+  /* ============================================================
+     Usuários, autenticação e perfis de acesso
+     - Autenticação: sessão local (apenas userId) validada contra a
+       coleção "users" do Firestore (fonte da verdade, em tempo real).
+     - Autorização: mapa central PERMISSIONS consultado pela UI E
+       pela camada de persistência (não basta esconder botões).
+     ============================================================ */
+  const SESSION_KEY = 'orquestradorSession_v1';
+  const USERS_CACHE_KEY = 'orquestradorUsersCache_v1';
+
+  const ROLE_DEFS = {
+    admin: { label: 'Admin', color: '#8B5CF6' },
+    editor: { label: 'Editor', color: '#4D8DF6' },
+    viewer: { label: 'Visualizador', color: '#10B981' },
+  };
+
+  const PERMISSIONS = {
+    // managePlanners/cloudWrite valem apenas para o PRÓPRIO espaço de arquivos do usuário
+    admin: { manageUsers: true, managePlanners: true, createAdjustments: true, deleteAdjustments: true, cloudWrite: true },
+    editor: { manageUsers: false, managePlanners: true, createAdjustments: true, deleteAdjustments: false, cloudWrite: true },
+    viewer: { manageUsers: false, managePlanners: true, createAdjustments: false, deleteAdjustments: false, cloudWrite: true },
+  };
+
+  const auth = {
+    user: null,          // sessão atual {id, username, fullName, area, role, active}
+    users: [],           // coleção "users" sincronizada em tempo real
+    loaded: false,
+    pendingUserId: null, // sessão persistida aguardando validação na nuvem
+  };
+
+  function can(action) {
+    if (!auth.user) return false;
+    const p = PERMISSIONS[auth.user.role];
+    return !!(p && p[action]);
+  }
+
+  function isAdmin() { return !!auth.user && auth.user.role === 'admin'; }
+
+  function normalizeUsername(u) { return normalizeStr(u).replace(/\s+/g, ''); }
+
+  /* ============================================================
+     Senhas — PBKDF2-SHA256 via WebCrypto. Nunca em texto puro:
+     o banco guarda somente {salt, iterations, hash}.
+     ============================================================ */
+  const PASS_ITERATIONS = 120000;
+
+  // Credencial inicial de configuração do admin: apenas o HASH (a senha não existe no código)
+  const BOOTSTRAP_ADMIN = {
+    username: 'admin',
+    salt: '20e5645d6cb5d2c90cc6f8553a4a50e5',
+    hash: '0de810d80248f9699ad4d0adf37746e272a11fc48da2b6992f13ab40844d4d4c',
+    iterations: 120000,
+  };
+
+  function hexToBytes(hex) {
+    const out = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return out;
+  }
+
+  function bytesToHex(buf) {
+    return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  async function pbkdf2Hex(password, saltHex, iterations) {
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits(
+      { name: 'PBKDF2', hash: 'SHA-256', salt: hexToBytes(saltHex), iterations }, key, 256);
+    return bytesToHex(bits);
+  }
+
+  async function hashPassword(password) {
+    const salt = bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
+    return { algo: 'PBKDF2-SHA256', iterations: PASS_ITERATIONS, salt, hash: await pbkdf2Hex(password, salt, PASS_ITERATIONS) };
+  }
+
+  async function verifyPassword(pass, password) {
+    if (!pass || !pass.salt || !pass.hash) return false;
+    try {
+      return (await pbkdf2Hex(password, pass.salt, pass.iterations || PASS_ITERATIONS)) === pass.hash;
+    } catch (e) { return false; }
+  }
+
+  function emailValid(email) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(email || '').trim());
+  }
+
+  /* Token de recuperação: temporário (30 min), uso único, armazenado só como hash */
+  const TOKEN_ITERATIONS = 20000;
+  const TOKEN_TTL_MS = 30 * 60000;
+
+  function genRecoveryToken() {
+    const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+    const buf = crypto.getRandomValues(new Uint8Array(8));
+    let t = '';
+    for (let i = 0; i < 8; i++) {
+      t += chars[buf[i] % chars.length];
+      if (i === 3) t += '-';
+    }
+    return t;
+  }
+
+  function normalizeToken(t) { return String(t || '').replace(/[\s\-]/g, '').toUpperCase(); }
+
+  // Emite token para o usuário (Admin) — o valor só existe no e-mail a ser enviado
+  async function issueResetToken(userId) {
+    if (!isAdmin()) throw new Error('Apenas administradores podem gerar tokens de recuperação.');
+    const u = auth.users.find(x => x.id === userId);
+    if (!u) throw new Error('Usuário não encontrado.');
+    if (!emailValid(u.email)) throw new Error('O usuário precisa de um e-mail válido cadastrado.');
+    const token = genRecoveryToken();
+    const salt = bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
+    const hash = await pbkdf2Hex(normalizeToken(token), salt, TOKEN_ITERATIONS);
+    await persistUserDoc({
+      ...u,
+      resetToken: { salt, hash, expiresAt: new Date(Date.now() + TOKEN_TTL_MS).toISOString() },
+      updatedAt: new Date().toISOString(),
+      updatedBy: auth.user.username,
+    });
+    logAudit('Token de recuperação gerado', u.username, '', `expira em 30 min · envio para ${u.email}`);
+    return token;
+  }
+
+  // Resgate do token na tela de login (usuário não autenticado)
+  async function redeemResetToken(username, tokenInput, novaSenha) {
+    const norm = normalizeUsername(username);
+    const u = auth.users.find(x => x.usernameNorm === norm);
+    if (!u || !u.resetToken) throw new Error('Token inválido ou inexistente. Solicite um novo a um administrador.');
+    if (u.active === false) throw new Error('Este usuário está desativado.');
+    if (!emailValid(u.email)) throw new Error('Cadastre um e-mail válido antes de definir uma senha.');
+    if (new Date(u.resetToken.expiresAt).getTime() < Date.now()) throw new Error('Token expirado. Solicite um novo.');
+    const hash = await pbkdf2Hex(normalizeToken(tokenInput), u.resetToken.salt, TOKEN_ITERATIONS);
+    if (hash !== u.resetToken.hash) throw new Error('Token inválido.');
+    const user = { ...u, pass: await hashPassword(novaSenha), updatedAt: new Date().toISOString(), updatedBy: u.username };
+    delete user.resetToken;    // uso único
+    delete user.resetRequestedAt;
+    delete user.firstAccess;
+    await persistUserDoc(user);
+    logAudit('Senha redefinida via token', u.username, 'Sem senha / recuperação', 'Senha cadastrada');
+    return user;
+  }
+
+  /* ============================================================
+     Rastreabilidade — trilha de auditoria (coleção "audit").
+     Nunca registra senhas, hashes ou tokens.
+     ============================================================ */
+  function logAudit(action, target, before, after) {
+    if (!cloud.db) return;
+    const u = auth.user || {};
+    cloud.db.collection('audit').add({
+      atIso: new Date().toISOString(),
+      userId: u.id || null,
+      username: u.username || 'anônimo',
+      fullName: u.fullName || '',
+      role: u.role || null,
+      action: String(action || ''),
+      target: String(target || ''),
+      before: before == null ? '' : String(before),
+      after: after == null ? '' : String(after),
+    }).catch(() => {});
+  }
+
+  function userIdGen() { return 'usr_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8); }
+
+  function cacheUsers() {
+    try { localStorage.setItem(USERS_CACHE_KEY, JSON.stringify(auth.users)); } catch (e) {}
+  }
+
+  function loadSession() {
+    let session = null;
+    try { session = JSON.parse(localStorage.getItem(SESSION_KEY)); } catch (e) {}
+    if (!session || !session.userId) return;
+    auth.pendingUserId = session.userId;
+    // Resolve pelo cache para evitar UI anônima até a nuvem responder (revalidado no snapshot)
+    try {
+      const cached = JSON.parse(localStorage.getItem(USERS_CACHE_KEY)) || [];
+      const u = cached.find(x => x.id === session.userId);
+      if (u && u.active !== false) auth.user = u;
+    } catch (e) {}
+  }
+
+  function setSession(user) {
+    auth.user = user || null;
+    auth.pendingUserId = user ? user.id : null;
+    try {
+      if (user) localStorage.setItem(SESSION_KEY, JSON.stringify({ userId: user.id }));
+      else localStorage.removeItem(SESSION_KEY);
+    } catch (e) {}
+  }
+
+  // Reação em tempo real a mudanças no próprio usuário (desativação, troca de perfil).
+  // Só derruba a sessão com dado confirmado pelo servidor — nunca por cache/erro transitório.
+  function revalidateSession(serverConfirmed) {
+    const targetId = auth.user ? auth.user.id : auth.pendingUserId;
+    if (!targetId) return;
+    const fresh = auth.users.find(u => u.id === targetId);
+    if (!fresh) {
+      if (serverConfirmed && auth.user) {
+        setSession(null);
+        switchUserContext().then(() => applyAccessUI());
+        alert('Seu acesso foi removido por um administrador.');
+      }
+      return;
+    }
+    if (fresh.active === false) {
+      if (auth.user) {
+        setSession(null);
+        switchUserContext().then(() => applyAccessUI());
+        alert('Seu acesso foi desativado por um administrador.');
+      } else {
+        auth.pendingUserId = null;
+      }
+      return;
+    }
+    const roleChanged = !auth.user || auth.user.role !== fresh.role;
+    auth.user = fresh;
+    if (roleChanged) applyAccessUI();
+    else renderUserArea();
+  }
+
+  let lastUsersJson = null;
+  let adminEnsured = false;
+
+  // Garante que a conta "admin" exista com a credencial inicial (só o hash — a senha nunca aparece)
+  async function ensureAdminAccount() {
+    if (adminEnsured || !cloud.db || !auth.loaded) return;
+    if (auth.users.some(u => u.usernameNorm === BOOTSTRAP_ADMIN.username)) { adminEnsured = true; return; }
+    adminEnsured = true;
+    const nowIso = new Date().toISOString();
+    try {
+      await persistUserDoc({
+        id: 'usr_admin', // id fixo: criação idempotente entre sessões simultâneas
+        username: 'admin',
+        usernameNorm: 'admin',
+        fullName: 'Administrador',
+        area: '',
+        email: '',
+        role: 'admin',
+        active: true,
+        pass: { algo: 'PBKDF2-SHA256', iterations: BOOTSTRAP_ADMIN.iterations, salt: BOOTSTRAP_ADMIN.salt, hash: BOOTSTRAP_ADMIN.hash },
+        firstAccess: true,
+        createdAt: nowIso,
+        createdBy: 'credencial inicial de configuração',
+        updatedAt: nowIso,
+      });
+      renderUserArea();
+      if (state.activeTab === 'admin') renderAdminTab();
+    } catch (e) {
+      adminEnsured = false;
+      console.warn('Não foi possível provisionar a conta admin inicial.', e);
+    }
+  }
+
+  function processUsersSnapshot(snap, serverConfirmed) {
+    auth.users = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    auth.users.sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+    auth.loaded = true;
+    if (serverConfirmed) ensureAdminAccount();
+    // Evita re-render (e perda de digitação no formulário) quando nada mudou
+    const json = JSON.stringify(auth.users);
+    const changed = json !== lastUsersJson;
+    lastUsersJson = json;
+    cacheUsers();
+    revalidateSession(serverConfirmed);
+    if (!changed) return;
+    renderUserArea();
+    const loginVisible = !document.getElementById('loginScreen').classList.contains('hidden');
+    if (loginVisible) renderLoginScreen();
+    if (state.activeTab === 'admin') renderAdminTab();
+  }
+
+  function subscribeUsers() {
+    if (!cloud.db) {
+      try { auth.users = JSON.parse(localStorage.getItem(USERS_CACHE_KEY)) || []; } catch (e) { auth.users = []; }
+      auth.loaded = true;
+      revalidateSession(false);
+      return;
+    }
+    cloud.db.collection('users').onSnapshot(snap => {
+      processUsersSnapshot(snap, !snap.metadata.fromCache && !snap.metadata.hasPendingWrites);
+    }, err => {
+      console.warn('Falha ao sincronizar usuários — usando cache local.', err);
+      try {
+        const cached = JSON.parse(localStorage.getItem(USERS_CACHE_KEY)) || [];
+        if (cached.length) auth.users = cached;
+      } catch (e) {}
+      auth.loaded = true;
+      revalidateSession(false);
+      renderUserArea();
+    });
+    // Fallback: redes/proxies que bloqueiam o canal de push do Firestore
+    setInterval(async () => {
+      try {
+        const snap = await cloud.db.collection('users').get();
+        processUsersSnapshot(snap, !snap.metadata.fromCache);
+      } catch (e) {}
+    }, 30000);
+  }
+
+  function countActiveAdmins() {
+    return auth.users.filter(u => u.role === 'admin' && u.active !== false).length;
+  }
+
+  async function persistUserDoc(user) {
+    const { id, ...data } = user;
+    Object.keys(data).forEach(k => { if (data[k] === undefined) delete data[k]; });
+    if (cloud.db) {
+      await cloud.db.collection('users').doc(id).set(data);
+    }
+    // Atualização otimista local (o snapshot confirma em seguida)
+    const idx = auth.users.findIndex(u => u.id === id);
+    if (idx >= 0) auth.users[idx] = user;
+    else auth.users.push(user);
+    cacheUsers();
+  }
+
+  async function createUser({ username, fullName, area, role, email }) {
+    if (!isAdmin()) throw new Error('Apenas administradores podem criar usuários.');
+    const uname = String(username || '').trim();
+    if (!uname) throw new Error('Informe o nome de usuário.');
+    const norm = normalizeUsername(uname);
+    if (auth.users.some(u => u.usernameNorm === norm)) throw new Error(`O nome de usuário "${uname}" já está em uso.`);
+    if (!ROLE_DEFS[role]) role = 'viewer';
+    const nowIso = new Date().toISOString();
+    const user = {
+      id: userIdGen(),
+      username: uname,
+      usernameNorm: norm,
+      fullName: String(fullName || '').trim() || uname,
+      area: String(area || '').trim(),
+      email: String(email || '').trim(),
+      role,
+      active: true,
+      createdAt: nowIso,
+      createdBy: auth.user ? auth.user.username : 'sistema',
+      updatedAt: nowIso,
+    };
+    await persistUserDoc(user);
+    logAudit('Usuário criado', uname, '', `perfil ${ROLE_DEFS[role].label}${user.area ? ' · área ' + user.area : ''}`);
+    return user;
+  }
+
+  // Primeiro acesso: valida a credencial inicial (só hash no código) e cria a conta admin
+  async function bootstrapAdmin(password) {
+    if (auth.users.some(u => u.usernameNorm === BOOTSTRAP_ADMIN.username)) return null;
+    const ok = (await pbkdf2Hex(password, BOOTSTRAP_ADMIN.salt, BOOTSTRAP_ADMIN.iterations)) === BOOTSTRAP_ADMIN.hash;
+    if (!ok) return null;
+    const nowIso = new Date().toISOString();
+    const user = {
+      id: 'usr_admin', // mesmo id do provisionamento automático — criação idempotente
+      username: 'admin',
+      usernameNorm: 'admin',
+      fullName: 'Administrador',
+      area: '',
+      email: '',
+      role: 'admin',
+      active: true,
+      pass: await hashPassword(password),
+      firstAccess: true,
+      createdAt: nowIso,
+      createdBy: 'credencial inicial de configuração',
+      updatedAt: nowIso,
+    };
+    await persistUserDoc(user);
+    return user;
+  }
+
+  async function updateUser(id, patch) {
+    if (!isAdmin()) throw new Error('Apenas administradores podem editar usuários.');
+    const existing = auth.users.find(u => u.id === id);
+    if (!existing) throw new Error('Usuário não encontrado.');
+    if (patch.username !== undefined) {
+      const uname = String(patch.username || '').trim();
+      if (!uname) throw new Error('Informe o nome de usuário.');
+      const norm = normalizeUsername(uname);
+      if (auth.users.some(u => u.id !== id && u.usernameNorm === norm)) throw new Error(`O nome de usuário "${uname}" já está em uso.`);
+      patch.username = uname;
+      patch.usernameNorm = norm;
+    }
+    // Não deixar o sistema sem nenhum Admin ativo
+    const losingAdmin = existing.role === 'admin' && existing.active !== false &&
+      ((patch.role && patch.role !== 'admin') || patch.active === false);
+    if (losingAdmin && countActiveAdmins() <= 1) throw new Error('O sistema precisa de pelo menos um Admin ativo.');
+    const user = { ...existing, ...patch, updatedAt: new Date().toISOString(), updatedBy: auth.user.username };
+    await persistUserDoc(user);
+    // Auditoria: diff dos campos visíveis (nunca senha/hash)
+    const AUDIT_FIELDS = { username: 'usuário', fullName: 'nome', area: 'área', email: 'e-mail', role: 'perfil', active: 'status' };
+    const fmtVal = (k, v) => k === 'role' ? (ROLE_DEFS[v] ? ROLE_DEFS[v].label : v) : k === 'active' ? (v === false ? 'Inativo' : 'Ativo') : (v || '—');
+    const diffs = Object.keys(AUDIT_FIELDS)
+      .filter(k => patch[k] !== undefined && String(existing[k] ?? '') !== String(patch[k] ?? ''))
+      .map(k => AUDIT_FIELDS[k]);
+    if (diffs.length) {
+      const before = diffs.map(l => { const k = Object.keys(AUDIT_FIELDS).find(x => AUDIT_FIELDS[x] === l); return `${l}: ${fmtVal(k, existing[k])}`; }).join(' · ');
+      const after = diffs.map(l => { const k = Object.keys(AUDIT_FIELDS).find(x => AUDIT_FIELDS[x] === l); return `${l}: ${fmtVal(k, user[k])}`; }).join(' · ');
+      logAudit('Usuário editado', existing.username, before, after);
+    }
+    return user;
+  }
+
+  async function resetPassword(id) {
+    if (!isAdmin()) throw new Error('Apenas administradores podem resetar senhas.');
+    const existing = auth.users.find(u => u.id === id);
+    if (!existing) throw new Error('Usuário não encontrado.');
+    const user = { ...existing, updatedAt: new Date().toISOString(), updatedBy: auth.user.username };
+    delete user.pass;
+    delete user.firstAccess;
+    delete user.resetRequestedAt;
+    delete user.resetToken;
+    await persistUserDoc(user);
+    logAudit('Senha resetada', existing.username, existing.pass ? 'Senha cadastrada' : 'Sem senha', 'Sem senha (login somente com usuário)');
+    return user;
+  }
+
+  async function deleteUser(id) {
+    if (!isAdmin()) throw new Error('Apenas administradores podem excluir usuários.');
+    const existing = auth.users.find(u => u.id === id);
+    if (!existing) throw new Error('Usuário não encontrado.');
+    if (existing.id === auth.user.id) throw new Error('Você não pode excluir o seu próprio usuário — peça a outro administrador.');
+    if (cloud.db) await cloud.db.collection('users').doc(id).delete();
+    auth.users = auth.users.filter(u => u.id !== id);
+    cacheUsers();
+    logAudit('Usuário excluído', existing.username,
+      `perfil ${(ROLE_DEFS[existing.role] || ROLE_DEFS.viewer).label} · ${existing.active === false ? 'Inativo' : 'Ativo'}`, 'conta removida');
+    return existing;
+  }
+
+  // O próprio usuário só pode alterar e-mail e senha — dados estruturais são do Admin
+  async function updateSelfAccount(patch) {
+    if (!auth.user) throw new Error('Faça login para alterar sua conta.');
+    const existing = auth.users.find(u => u.id === auth.user.id);
+    if (!existing) throw new Error('Conta não encontrada.');
+    const user = { ...existing, updatedAt: new Date().toISOString(), updatedBy: existing.username };
+    if (patch.email !== undefined) user.email = String(patch.email).trim();
+    if (patch.pass !== undefined) user.pass = patch.pass;
+    if (patch.firstAccess !== undefined) user.firstAccess = patch.firstAccess;
+    if (patch.clearReset) delete user.resetRequestedAt;
+    await persistUserDoc(user);
+    auth.user = user;
+    return user;
+  }
+
+  /* ============================================================
+     Contexto de dados do usuário — "Meus arquivos → Meus dados"
+     ============================================================ */
+  async function loadDataForCurrentUser() {
+    state.planners = [];
+    state.activePlannerId = null;
+    cloud.fingerprints = {};
+    cloud.remoteStamps = {};
+
+    if (!auth.user) {
+      setSyncStatus(cloud.db ? 'readonly' : 'local');
+      return;
+    }
+
     let fromCloud = null;
     try {
-      fromCloud = await loadFromCloud();
+      fromCloud = await loadUserPlanners(auth.user.id);
     } catch (e) {
       console.warn('Não foi possível carregar da nuvem — usando dados locais.', e);
       setSyncStatus('error');
     }
 
-    if (fromCloud && fromCloud.planners.length > 0) {
-      state.planners = fromCloud.planners;
-      const found = state.planners.find(p => p.id === fromCloud.activePlannerId);
-      state.activePlannerId = found ? found.id : state.planners[0].id;
-      // Marca como já sincronizado para não reenviar o que acabou de baixar
+    const restored = loadFromStorage(); // cache local do PRÓPRIO usuário
+
+    if (fromCloud && fromCloud.length > 0) {
+      state.planners = fromCloud;
       state.planners.forEach(p => { cloud.fingerprints[p.id] = plannerFingerprint(p); });
-      cloud.metaFingerprint = fromCloud.activePlannerId === state.activePlannerId ? state.activePlannerId : null;
+      const cached = restored && state.planners.find(p => p.id === restored.activePlannerId);
+      state.activePlannerId = cached ? restored.activePlannerId : state.planners[0].id;
       writeLocal();
       setSyncStatus('synced');
       return;
     }
 
-    const restored = loadFromStorage();
     if (restored && Array.isArray(restored.planners) && restored.planners.length > 0) {
       state.planners = restored.planners.map(p => ({
         ...p,
+        ownerId: auth.user.id,
+        ownerUsername: auth.user.username,
         tasks: (p.tasks || []).map(t => (t && t.statusGroup) ? t : normalizeExistingTask(t)),
+        adjustments: Array.isArray(p.adjustments) ? p.adjustments : [],
       }));
       const found = state.planners.find(p => p.id === restored.activePlannerId);
       state.activePlannerId = found ? found.id : state.planners[0].id;
-      saveToStorage(); // migra os dados locais para a nuvem
-    } else {
-      const planner = makeDefaultPlanner();
-      state.planners = [planner];
-      state.activePlannerId = planner.id;
-      saveToStorage();
+      saveToStorage(); // migra o cache local para a nuvem
+      return;
     }
+    // Usuário novo: espaço vazio — ele importa os próprios arquivos
+  }
+
+  // Troca de contexto ao entrar/sair: recarrega dados e listeners do usuário
+  async function switchUserContext() {
+    clearTimeout(cloud.saveTimer);
+    cloud.saveTimer = null;
+    state.filters = {};
+    state.editingAdjustmentId = null;
+    state.editingPlannerId = null;
+    state.cardsVisibleCount = 24;
+    await loadDataForCurrentUser();
+    subscribePlanners();
+    populatePlannerSwitcher();
   }
 
   function resetAllPlanners() {
-    if (!confirm('Isso removerá todos os planners adicionados e restaurará apenas os dados originais. Deseja continuar?')) return;
-    try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
-    const planner = makeDefaultPlanner();
-    state.planners = [planner];
-    state.activePlannerId = planner.id;
+    if (!can('managePlanners')) { alert('Seu perfil não permite alterar os planners.'); return; }
+    if (!confirm('Isso removerá TODOS os seus arquivos importados e ajustes. Essa ação não pode ser desfeita. Deseja continuar?')) return;
+    const key = storageKey();
+    if (key) { try { localStorage.removeItem(key); } catch (e) {} }
+    logAudit('Todos os arquivos removidos', auth.user.username, `${state.planners.length} planner(s)`, 'espaço vazio');
+    state.planners = [];
+    state.activePlannerId = null;
     state.filters = {};
     state.cardsVisibleCount = 24;
     saveToStorage();
@@ -491,9 +1065,78 @@
   /* ============================================================
      Gestão de planners
      ============================================================ */
+  function getActivePlanner() {
+    return state.planners.find(pl => pl.id === state.activePlannerId) || null;
+  }
+
   function getActiveTasks() {
-    const p = state.planners.find(pl => pl.id === state.activePlannerId);
-    return p ? p.tasks : [];
+    const p = getActivePlanner();
+    return p ? getEffectiveTasks(p) : [];
+  }
+
+  /* ============================================================
+     Ajustes manuais — camada de sobreposição sobre os dados do Excel.
+     Os dados originais NUNCA são sobrescritos; quando existe um ajuste
+     para a atividade, as datas ajustadas têm prioridade nas análises.
+     ============================================================ */
+  function adjustmentMatchesTask(adj, task) {
+    if (adj.taskId && String(adj.taskId) === String(task.id)) return true;
+    return !!adj.taskName && normalizeStr(adj.taskName) === normalizeStr(task.name);
+  }
+
+  function findAdjustmentForTask(planner, task) {
+    return (planner.adjustments || []).find(a => adjustmentMatchesTask(a, task)) || null;
+  }
+
+  function findTaskForAdjustment(planner, adj) {
+    return (planner.tasks || []).find(t => adjustmentMatchesTask(adj, t)) || null;
+  }
+
+  // Retorna cópias das tarefas com as datas ajustadas aplicadas (originais preservados)
+  function getEffectiveTasks(planner) {
+    const adjustments = planner.adjustments || [];
+    if (!adjustments.length) return planner.tasks;
+    return planner.tasks.map(t => {
+      const adj = adjustments.find(a => adjustmentMatchesTask(a, t));
+      if (!adj) return t;
+      const out = {
+        ...t,
+        _adjusted: true,
+        _adjustmentId: adj.id,
+        _original: { start_date: t.start_date, due_date: t.due_date, completed_at: t.completed_at },
+      };
+      if (adj.start_date) out.start_date = adj.start_date;
+      if (adj.due_date) out.due_date = adj.due_date;
+      if (adj.completed_at) out.completed_at = adj.completed_at;
+      return out;
+    });
+  }
+
+  function saveAdjustment(planner, adj) {
+    if (!can('createAdjustments')) { alert('Seu perfil não permite registrar ajustes.'); return; }
+    if (!Array.isArray(planner.adjustments)) planner.adjustments = [];
+    const idx = planner.adjustments.findIndex(a =>
+      a.id === adj.id || (adj.taskId && String(a.taskId) === String(adj.taskId)));
+    const prev = idx >= 0 ? planner.adjustments[idx] : null;
+    const saved = prev ? { ...prev, ...adj } : adj;
+    if (idx >= 0) planner.adjustments[idx] = saved;
+    else planner.adjustments.push(saved);
+    const fmtAdj = a => `início ${a.start_date || '—'} · previsão ${a.due_date || '—'} · fim ${a.completed_at || '—'}`;
+    logAudit(prev ? 'Ajuste atualizado' : 'Ajuste registrado', adj.taskName,
+      prev ? fmtAdj(prev) : 'sem ajuste (dados originais do Excel)', fmtAdj(saved));
+    saveToStorage();
+  }
+
+  function removeAdjustment(planner, adjId) {
+    if (!can('deleteAdjustments')) { alert('Somente administradores podem excluir ajustes.'); return; }
+    const adj = (planner.adjustments || []).find(a => a.id === adjId);
+    planner.adjustments = (planner.adjustments || []).filter(a => a.id !== adjId);
+    if (adj) {
+      logAudit('Ajuste excluído', adj.taskName,
+        `início ${adj.start_date || '—'} · previsão ${adj.due_date || '—'} · fim ${adj.completed_at || '—'}`,
+        'análises voltam aos dados originais do Excel');
+    }
+    saveToStorage();
   }
 
   function uniquePlannerName(base) {
@@ -505,8 +1148,20 @@
   }
 
   function addPlanner(name, tasks) {
+    if (!can('managePlanners')) { alert('Seu perfil não permite adicionar planners.'); return; }
     const color = PLANNER_COLORS[state.planners.length % PLANNER_COLORS.length];
-    const planner = { id: genId(), name, tasks, addedAt: new Date().toISOString(), color };
+    const fileName = state.pendingImport ? state.pendingImport.fileName : name;
+    const planner = {
+      id: genId(), name, tasks,
+      addedAt: new Date().toISOString(), color, adjustments: [],
+      // Isolamento: arquivo vinculado ao usuário autenticado que importou
+      ownerId: auth.user.id,
+      ownerUsername: auth.user.username,
+      fileName,
+      importedBy: auth.user.fullName || auth.user.username,
+      version: state.planners.filter(p => p.fileName === fileName).length + 1,
+    };
+    logAudit('Planner importado', name, '', `${tasks.length} tarefas · arquivo ${fileName}`);
     state.planners.push(planner);
     state.activePlannerId = planner.id;
     state.filters = {};
@@ -516,8 +1171,10 @@
   }
 
   function renamePlanner(id, newName) {
+    if (!can('managePlanners')) return;
     const p = state.planners.find(pl => pl.id === id);
-    if (p && newName && newName.trim()) {
+    if (p && newName && newName.trim() && p.name !== newName.trim()) {
+      logAudit('Planner renomeado', p.name, p.name, newName.trim());
       p.name = newName.trim();
       saveToStorage();
       populatePlannerSwitcher();
@@ -525,6 +1182,7 @@
   }
 
   function updatePlanner(id, name, color) {
+    if (!can('managePlanners')) return;
     const p = state.planners.find(pl => pl.id === id);
     if (!p) return;
     if (name && name.trim()) p.name = name.trim();
@@ -537,13 +1195,12 @@
   }
 
   function removePlanner(id) {
+    if (!can('managePlanners')) { alert('Seu perfil não permite excluir planners.'); return; }
+    const removed = state.planners.find(p => p.id === id);
+    if (removed) logAudit('Planner excluído', removed.name, `${removed.tasks.length} tarefas`, '');
     state.planners = state.planners.filter(p => p.id !== id);
-    // Se excluiu o último, cria um planner vazio para o app continuar funcional
-    if (state.planners.length === 0) {
-      state.planners = [{ id: genId(), name: 'Novo Planner', tasks: [], addedAt: new Date().toISOString(), color: PLANNER_COLORS[0] }];
-    }
     if (!state.planners.find(p => p.id === state.activePlannerId)) {
-      state.activePlannerId = state.planners[0].id;
+      state.activePlannerId = state.planners.length ? state.planners[0].id : null;
     }
     state.filters = {};
     saveToStorage();
@@ -565,6 +1222,7 @@
   function populatePlannerSwitcher() {
     const sel = document.getElementById('plannerSwitcher');
     if (!sel) return;
+    sel.style.display = state.planners.length ? '' : 'none';
     sel.innerHTML = state.planners.map(p =>
       `<option value="${p.id}" ${p.id === state.activePlannerId ? 'selected' : ''}>${escapeHtml(p.name)}</option>`
     ).join('');
@@ -687,6 +1345,11 @@
   }
 
   function onPlannerFileSelected(file) {
+    if (!can('managePlanners')) {
+      plannerUploadMessage = { type: 'error', text: 'Seu perfil não permite importar planners.' };
+      renderPlannersTab();
+      return;
+    }
     if (!/\.(xlsx|xls|csv)$/i.test(file.name)) {
       plannerUploadMessage = { type: 'error', text: 'Por favor, selecione um arquivo Excel (.xlsx, .xls) ou CSV (.csv)' };
       renderPlannersTab();
@@ -983,7 +1646,7 @@
   function renderPanel() {
     // Na aba Comparar os filtros valem para todos os planners
     const tasks = state.activeTab === 'compare'
-      ? state.planners.flatMap(p => p.tasks)
+      ? state.planners.flatMap(p => getEffectiveTasks(p))
       : getActiveTasks();
     document.getElementById('panelContent').innerHTML = filterPanelHtml(tasks);
     bindFilterPanel();
@@ -1726,7 +2389,7 @@
      Tab: Planners
      ============================================================ */
   function plannerCardHtml(p, idx) {
-    const m = computeMetrics(p.tasks);
+    const m = computeMetrics(getEffectiveTasks(p));
     const active = p.id === state.activePlannerId;
     const delay = Math.min(idx * 40, 240);
     const activeStyle = active ? `box-shadow:0 0 0 2px ${p.color}55;border-color:${p.color};` : '';
@@ -1791,10 +2454,10 @@
     root.innerHTML = `
       <div class="planners-header">
         <div>
-          <h2 class="section-title" style="margin-bottom:.25rem">Meus Planners</h2>
-          <p class="section-subtitle">Adicione quantos planners exportados (Excel ou CSV) quiser — a aplicação identifica as colunas automaticamente.</p>
+          <h2 class="section-title" style="margin-bottom:.25rem">Meus Arquivos</h2>
+          <p class="section-subtitle">Os arquivos importados (Excel ou CSV) ficam vinculados ao seu usuário <strong>${escapeHtml(auth.user ? auth.user.username : '')}</strong> — outros usuários não os visualizam. A aplicação identifica as colunas automaticamente.</p>
         </div>
-        <button class="btn-secondary subtle" id="btnResetAllPlanners">Restaurar dados originais</button>
+        <button class="btn-secondary subtle" id="btnResetAllPlanners">Remover todos os meus arquivos</button>
       </div>
 
       <div class="dropzone" id="plannerDropzone">
@@ -1886,17 +2549,210 @@
   /* ============================================================
      Tab: Comparar
      ============================================================ */
+  /* ============================================================
+     Análise de prazos — previsto × realizado (tarefas concluídas)
+     ============================================================ */
+  function computeDeadlineStats(tasks) {
+    const rows = [];
+    tasks.forEach(t => {
+      if (t.statusGroup !== 'completed') return;
+      const due = parseDate(t.due_date);
+      const done = parseDate(t.completed_at);
+      if (!due || !done) return;
+      const start = parseDate(t.start_date);
+      // Prazo estimado = previsão - início | Prazo real = conclusão - início
+      const estimated = start ? dayDiff(start, due) : null;
+      const real = start ? dayDiff(start, done) : null;
+      // Desvio = prazo real - prazo estimado (equivale a conclusão - previsão)
+      const deviation = dayDiff(due, done);
+      let deviationPct = null;
+      if (estimated !== null && estimated !== 0) deviationPct = Math.round((deviation / estimated) * 1000) / 10;
+      rows.push({ task: t, start, due, done, estimated, real, deviation, deviationPct });
+    });
+
+    rows.sort((a, b) => b.deviation - a.deviation);
+
+    const before = rows.filter(r => r.deviation < 0);
+    const onTime = rows.filter(r => r.deviation === 0);
+    const after = rows.filter(r => r.deviation > 0);
+    const avg = arr => (arr.length ? arr.reduce((s, x) => s + x, 0) / arr.length : null);
+    const round1 = v => (v === null ? null : Math.round(v * 10) / 10);
+
+    return {
+      rows,
+      total: rows.length,
+      before: before.length,
+      onTime: onTime.length,
+      after: after.length,
+      avgAnticipation: round1(avg(before.map(r => -r.deviation))),
+      avgDelay: round1(avg(after.map(r => r.deviation))),
+      avgDeviation: round1(avg(rows.map(r => r.deviation))),
+    };
+  }
+
+  function signedDays(v) {
+    if (v === null || v === undefined) return '—';
+    return (v > 0 ? '+' : '') + v + 'd';
+  }
+
+  function deviationClass(v) {
+    if (v < 0) return 'dev-neg';
+    if (v > 0) return 'dev-pos';
+    return 'dev-zero';
+  }
+
+  function deviationBadge(v) {
+    if (v < 0) return `<span class="badge-pill" style="background:${COLORS.success}18;color:${COLORS.success}">Antecipada</span>`;
+    if (v > 0) return `<span class="badge-pill" style="background:${COLORS.error}18;color:${COLORS.error}">Atrasada</span>`;
+    return `<span class="badge-pill" style="background:${COLORS.primary}18;color:${COLORS.primary}">No prazo</span>`;
+  }
+
+  function deadlineKpiCard(icon, label, value, color) {
+    return `
+      <div class="kpi-card kpi-card--static">
+        <div class="kpi-card__top">
+          <div>
+            <p class="kpi-card__label">${label}</p>
+            <p class="kpi-card__value">${value}</p>
+          </div>
+          <div class="kpi-card__icon" style="background:${color}15;color:${color}">${ICONS[icon]}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  function deadlineSectionHtml(dl, planner) {
+    const plannerName = planner ? planner.name : '—';
+    const hasAdjust = planner && (planner.adjustments || []).length > 0;
+
+    if (dl.total === 0) {
+      return `
+        <h3 class="section-title" style="font-size:1.05rem">Análise de Prazos — Previsto × Realizado</h3>
+        <p class="section-subtitle" style="margin-bottom:1rem">Planner ativo: <strong>${escapeHtml(plannerName)}</strong></p>
+        <div class="empty-state" style="margin-bottom:1.5rem">Nenhuma atividade concluída com data de previsão e data de conclusão disponíveis. Complete os dados na aba "Ajustes" para habilitar esta análise.</div>
+      `;
+    }
+
+    return `
+      <h3 class="section-title" style="font-size:1.05rem">Análise de Prazos — Previsto × Realizado</h3>
+      <p class="section-subtitle" style="margin-bottom:1rem">
+        Planner ativo: <strong>${escapeHtml(plannerName)}</strong> — atividades concluídas com datas de previsão e conclusão.
+        ${hasAdjust ? 'Ajustes manuais da aba "Ajustes" já aplicados.' : ''}
+      </p>
+
+      <div class="kpi-grid">
+        ${deadlineKpiCard('alertCircle', 'Atividades Analisadas', dl.total, COLORS.primary)}
+        ${deadlineKpiCard('checkCircle', 'Antes do Prazo', dl.before, COLORS.success)}
+        ${deadlineKpiCard('flag', 'No Prazo', dl.onTime, COLORS.primary)}
+        ${deadlineKpiCard('alertCircle', 'Após o Prazo', dl.after, COLORS.error)}
+        ${deadlineKpiCard('trendingUp', 'Média de Antecipação', dl.avgAnticipation !== null ? dl.avgAnticipation + 'd' : '—', COLORS.success)}
+        ${deadlineKpiCard('clock', 'Média de Atraso', dl.avgDelay !== null ? dl.avgDelay + 'd' : '—', COLORS.warning)}
+        ${deadlineKpiCard('calendar', 'Desvio Médio', dl.avgDeviation !== null ? signedDays(dl.avgDeviation) : '—', COLORS.primary)}
+      </div>
+
+      <div class="charts-grid" style="margin-bottom:1.5rem">
+        <div class="chart-card">
+          <h3>Cumprimento do Prazo</h3>
+          <canvas id="chartDeadlineSplit"></canvas>
+        </div>
+        <div class="chart-card">
+          <h3>Maiores Desvios (dias)</h3>
+          <canvas id="chartDeadlineDeviation"></canvas>
+        </div>
+      </div>
+
+      <div class="compare-table-card deadline-table-card" style="margin-bottom:2rem">
+        <div class="table-scroll deadline-table-scroll">
+          <table class="compare-table">
+            <thead>
+              <tr>
+                <th>Atividade</th><th>Início</th><th>Previsão</th><th>Conclusão</th>
+                <th>Prazo Estimado</th><th>Prazo Real</th><th>Desvio</th><th>Desvio %</th><th>Situação</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${dl.rows.map(r => `
+                <tr>
+                  <td class="deadline-task-name" title="${escapeHtml(r.task.name)}">
+                    ${escapeHtml(r.task.name)}
+                    ${r.task._adjusted ? '<span class="adjusted-tag" title="Datas complementadas manualmente na aba Ajustes">ajustada</span>' : ''}
+                  </td>
+                  <td>${r.start ? r.start.toLocaleDateString('pt-BR') : '—'}</td>
+                  <td>${r.due.toLocaleDateString('pt-BR')}</td>
+                  <td>${r.done.toLocaleDateString('pt-BR')}</td>
+                  <td>${r.estimated !== null ? r.estimated + 'd' : '—'}</td>
+                  <td>${r.real !== null ? r.real + 'd' : '—'}</td>
+                  <td class="${deviationClass(r.deviation)}"><strong>${signedDays(r.deviation)}</strong></td>
+                  <td class="${deviationClass(r.deviation)}">${r.deviationPct !== null ? (r.deviationPct > 0 ? '+' : '') + r.deviationPct + '%' : '—'}</td>
+                  <td>${deviationBadge(r.deviation)}</td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderDeadlineCharts(dl) {
+    const splitEl = document.getElementById('chartDeadlineSplit');
+    const devEl = document.getElementById('chartDeadlineDeviation');
+    if (!splitEl || !devEl || dl.total === 0) return;
+
+    state.compareCharts.deadlineSplit = new Chart(splitEl, {
+      type: 'doughnut',
+      data: {
+        labels: ['Antes do prazo', 'No prazo', 'Após o prazo'],
+        datasets: [{ data: [dl.before, dl.onTime, dl.after], backgroundColor: [COLORS.success, COLORS.primary, COLORS.error], borderWidth: 2, borderColor: '#fff' }],
+      },
+      options: { responsive: true, maintainAspectRatio: true, cutout: '62%', plugins: { legend: { position: 'bottom' } } },
+    });
+
+    const topDev = dl.rows
+      .slice()
+      .sort((a, b) => Math.abs(b.deviation) - Math.abs(a.deviation))
+      .slice(0, 10);
+    state.compareCharts.deadlineDeviation = new Chart(devEl, {
+      type: 'bar',
+      data: {
+        labels: topDev.map(r => r.task.name.length > 32 ? r.task.name.slice(0, 30) + '…' : r.task.name),
+        datasets: [{
+          data: topDev.map(r => r.deviation),
+          backgroundColor: topDev.map(r => (r.deviation > 0 ? COLORS.error : r.deviation < 0 ? COLORS.success : COLORS.primary)),
+          borderRadius: 6,
+        }],
+      },
+      options: {
+        indexAxis: 'y', responsive: true, maintainAspectRatio: true,
+        plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => signedDays(ctx.parsed.x) } } },
+        scales: { x: { ticks: { callback: v => signedDays(v) } } },
+      },
+    });
+  }
+
   function renderCompareTab() {
     const root = document.getElementById('compareRoot');
 
+    Object.values(state.compareCharts).forEach(c => c && c.destroy());
+    state.compareCharts = {};
+
+    const activePlanner = getActivePlanner();
+    const activeTasks = activePlanner ? getFilteredTasks(getEffectiveTasks(activePlanner)) : [];
+    const deadlineStats = computeDeadlineStats(activeTasks);
+    const deadlineHtml = deadlineSectionHtml(deadlineStats, activePlanner);
+
     if (state.planners.length < 2) {
-      root.innerHTML = `<div class="empty-state">Adicione pelo menos 2 planners na aba "Planners" para comparar resultados.</div>`;
+      root.innerHTML = `
+        ${deadlineHtml}
+        <h3 class="section-title" style="font-size:1.05rem">Comparativo entre Planners</h3>
+        <div class="empty-state">Adicione pelo menos 2 planners na aba "Planners" para comparar resultados.</div>
+      `;
+      renderDeadlineCharts(deadlineStats);
       return;
     }
 
-    // Filtros da barra lateral aplicados a todos os planners
+    // Filtros da barra lateral aplicados a todos os planners (com ajustes manuais aplicados)
     const rows = state.planners.map(p => {
-      const filtered = getFilteredTasks(p.tasks);
+      const filtered = getFilteredTasks(getEffectiveTasks(p));
       return { planner: p, tasks: filtered, metrics: computeMetrics(filtered) };
     });
 
@@ -1927,6 +2783,8 @@
     });
 
     root.innerHTML = `
+      ${deadlineHtml}
+      <h3 class="section-title" style="font-size:1.05rem">Comparativo entre Planners</h3>
       ${activeFilterCount > 0 ? `
       <div class="compare-filters-note">
         ${ICONS.checkCircle}
@@ -1986,8 +2844,7 @@
       </div>
     `;
 
-    Object.values(state.compareCharts).forEach(c => c && c.destroy());
-    state.compareCharts = {};
+    renderDeadlineCharts(deadlineStats);
 
     state.compareCharts.completion = new Chart(document.getElementById('chartCompareCompletion'), {
       type: 'bar',
@@ -2074,6 +2931,731 @@
   }
 
   /* ============================================================
+     Tab: Ajustes — complementa/corrige dados do Excel sem sobrescrevê-los
+     ============================================================ */
+  let adjustMessage = null;
+  let adjSelectedTaskId = null;
+
+  // Busca em memória: ignora acentos/maiúsculas, aceita termos parciais em qualquer ordem;
+  // prioriza nomes que começam com o termo pesquisado
+  function searchTasks(tasks, query, limit = 8) {
+    const q = normalizeStr(query);
+    if (!q) return [];
+    const tokens = q.split(/\s+/).filter(Boolean);
+    const results = [];
+    for (const t of tasks) {
+      const name = normalizeStr(t.name);
+      if (!tokens.every(tok => name.includes(tok))) continue;
+      let rank = 2;
+      if (name.startsWith(q)) rank = 0;
+      else if (name.startsWith(tokens[0])) rank = 1;
+      results.push({ task: t, rank, pos: name.indexOf(tokens[0]) });
+    }
+    results.sort((a, b) => a.rank - b.rank || a.pos - b.pos || a.task.name.localeCompare(b.task.name, 'pt-BR'));
+    return results.slice(0, limit).map(r => r.task);
+  }
+
+  function taskMetaLine(task) {
+    const parts = [];
+    if (task.category && task.category !== 'Sem categoria') parts.push(`Categoria: ${escapeHtml(task.category)}`);
+    if ((task.assignees || []).length) parts.push(`Responsável: ${escapeHtml(task.assignees.join(', '))}`);
+    if (task.status) parts.push(`Status: ${escapeHtml(task.status)}`);
+    return parts.join(' · ');
+  }
+
+  function toInputDate(value) {
+    const d = parseDate(value);
+    if (!d) return '';
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${d.getFullYear()}-${mm}-${dd}`;
+  }
+
+  function adjustDateCellHtml(origValue, adjValue) {
+    if (!adjValue) return `<span class="adjust-keep">${formatDate(origValue)}</span>`;
+    return `<span class="orig-strike">${formatDate(origValue)}</span> <strong>${formatDate(adjValue)}</strong>`;
+  }
+
+  function renderAdjustmentsTab() {
+    const root = document.getElementById('adjustmentsRoot');
+    if (!auth.user) {
+      root.innerHTML = `
+        <div class="empty-state">
+          <p style="margin:0 0 1rem">Faça login para acessar os seus ajustes.</p>
+          <button class="btn-primary" id="btnEmptyLoginAdj">Entrar</button>
+        </div>`;
+      document.getElementById('btnEmptyLoginAdj').onclick = openLoginScreen;
+      return;
+    }
+    const planner = getActivePlanner();
+    if (!planner) {
+      root.innerHTML = '<div class="empty-state">Você ainda não importou nenhum arquivo. Adicione um planner na aba "Planners" para registrar ajustes.</div>';
+      return;
+    }
+
+    const adjustments = planner.adjustments || [];
+    const canCreate = can('createAdjustments');
+    const canDelete = can('deleteAdjustments');
+    const editing = state.editingAdjustmentId ? adjustments.find(a => a.id === state.editingAdjustmentId) : null;
+    const editingTask = editing ? findTaskForAdjustment(planner, editing) : null;
+    if (editing) adjSelectedTaskId = editingTask ? editingTask.id : null;
+    const selectedTask = adjSelectedTaskId ? planner.tasks.find(t => String(t.id) === String(adjSelectedTaskId)) : null;
+    if (adjSelectedTaskId && !selectedTask) adjSelectedTaskId = null;
+    const today = toInputDate(new Date());
+
+    root.innerHTML = `
+      <div class="planners-header">
+        <div>
+          <h2 class="section-title" style="margin-bottom:.25rem">Ajustes Manuais</h2>
+          <p class="section-subtitle">
+            Complemente ou corrija datas de atividades do planner <strong>${escapeHtml(planner.name)}</strong>.
+            Os ajustes têm prioridade sobre os dados do Excel em todas as análises do dashboard — os dados originais permanecem preservados.
+            ${!canCreate ? '<br /><strong>Seu perfil permite somente consulta dos ajustes.</strong>' : ''}
+          </p>
+        </div>
+      </div>
+
+      ${canCreate ? `
+      <div class="adjust-form-card">
+        <h3 class="adjust-form-title">${editing ? 'Editar ajuste' : 'Novo ajuste'}</h3>
+        <div class="adjust-form-grid">
+          <div class="adjust-field adjust-field--full adjust-search-wrap">
+            <label>Tarefa *</label>
+            <div class="adjust-combo">
+              <input type="text" id="adjTaskSearch" placeholder="Clique para abrir a lista ou digite para pesquisar..." autocomplete="off" spellcheck="false"
+                value="${selectedTask ? escapeHtml(selectedTask.name) : ''}" />
+              <button type="button" class="adjust-combo-arrow" id="adjComboArrow" title="Abrir lista de tarefas" tabindex="-1">${ICONS.chevronDown}</button>
+            </div>
+            <div class="adjust-suggestions" id="adjTaskSuggestions" hidden></div>
+          </div>
+          <div class="adjust-field adjust-field--full" id="adjSelectedCard"></div>
+          <div class="adjust-field">
+            <label>Data de início</label>
+            <input type="date" id="adjStart" value="${editing ? toInputDate(editing.start_date) : ''}" />
+          </div>
+          <div class="adjust-field">
+            <label>Data de previsão</label>
+            <input type="date" id="adjDue" value="${editing ? toInputDate(editing.due_date) : ''}" />
+          </div>
+          <div class="adjust-field">
+            <label>Data de fim/conclusão</label>
+            <input type="date" id="adjDone" value="${editing ? toInputDate(editing.completed_at) : ''}" />
+          </div>
+          <div class="adjust-field">
+            <label>Responsável pelo ajuste</label>
+            <input type="text" id="adjResponsible" maxlength="60" placeholder="Opcional" value="${editing ? escapeHtml(editing.responsible || '') : escapeHtml(auth.user ? (auth.user.fullName || auth.user.username) : '')}" />
+          </div>
+          <div class="adjust-field">
+            <label>Data do ajuste</label>
+            <input type="date" id="adjDate" value="${editing ? toInputDate(editing.adjustedAt) || today : today}" />
+          </div>
+          <div class="adjust-field adjust-field--full">
+            <label>Observação</label>
+            <input type="text" id="adjNote" maxlength="200" placeholder="Opcional — ex.: data corrigida conforme registro da equipe" value="${editing ? escapeHtml(editing.note || '') : ''}" />
+          </div>
+        </div>
+        ${adjustMessage ? `
+        <div class="upload-message ${adjustMessage.type}">
+          ${adjustMessage.type === 'success' ? ICONS.checkCircle : ICONS.alertCircle}
+          <p>${escapeHtml(adjustMessage.text)}</p>
+        </div>` : ''}
+        <div class="adjust-actions">
+          ${editing ? '<button class="btn-secondary subtle" id="btnCancelAdjustment">Cancelar</button>' : ''}
+          <button class="btn-primary" id="btnSaveAdjustment">${editing ? 'Salvar alterações' : 'Adicionar ajuste'}</button>
+        </div>
+      </div>` : ''}
+
+      <h3 class="section-title" style="font-size:1.05rem;margin-top:2rem">Ajustes cadastrados (${adjustments.length})</h3>
+      ${adjustments.length === 0
+        ? `<div class="empty-state">Nenhum ajuste cadastrado.${canCreate ? ' Selecione uma atividade acima para complementar as datas.' : ''}</div>`
+        : `
+      <div class="compare-table-card">
+        <div class="table-scroll">
+          <table class="compare-table">
+            <thead>
+              <tr>
+                <th>Atividade</th><th>Início</th><th>Previsão</th><th>Conclusão</th>
+                <th>Responsável</th><th>Data do Ajuste</th><th>Observação</th><th>Registrado por</th>${canCreate || canDelete ? '<th></th>' : ''}
+              </tr>
+            </thead>
+            <tbody>
+              ${adjustments.map(a => {
+                const task = findTaskForAdjustment(planner, a);
+                const orig = task || {};
+                return `
+                <tr>
+                  <td class="deadline-task-name" title="${escapeHtml(a.taskName || '')}">
+                    ${escapeHtml(a.taskName || '—')}
+                    ${!task ? '<span class="adjusted-tag adjusted-tag--warn" title="Atividade não encontrada no planner atual">sem correspondência</span>' : ''}
+                  </td>
+                  <td>${adjustDateCellHtml(orig.start_date, a.start_date)}</td>
+                  <td>${adjustDateCellHtml(orig.due_date, a.due_date)}</td>
+                  <td>${adjustDateCellHtml(orig.completed_at, a.completed_at)}</td>
+                  <td>${escapeHtml(a.responsible || '—')}</td>
+                  <td>${formatDate(a.adjustedAt)}</td>
+                  <td class="adjust-note-cell" title="${escapeHtml(a.note || '')}">${escapeHtml(a.note || '—')}</td>
+                  <td title="${a.createdAtIso ? 'Registrado em ' + new Date(a.createdAtIso).toLocaleString('pt-BR') : ''}${a.updatedByName ? ' · Atualizado por ' + escapeHtml(a.updatedByName) + (a.updatedAtIso ? ' em ' + new Date(a.updatedAtIso).toLocaleString('pt-BR') : '') : ''}">${escapeHtml(a.createdByName || '—')}</td>
+                  ${canCreate || canDelete ? `
+                  <td>
+                    <div class="planner-card__icons">
+                      ${canCreate ? `<button class="icon-btn" data-adj-edit="${a.id}" title="Editar ajuste">${ICONS.pencil}</button>` : ''}
+                      ${canDelete ? `<button class="icon-btn danger" data-adj-remove="${a.id}" title="Excluir ajuste">${ICONS.trash}</button>` : ''}
+                    </div>
+                  </td>` : ''}
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>`}
+    `;
+
+    bindAdjustmentsTab(planner);
+  }
+
+  function bindAdjustmentsTab(planner) {
+    const byId = id => document.getElementById(id);
+    const searchInput = byId('adjTaskSearch');
+    const suggestBox = byId('adjTaskSuggestions');
+    const selectedCard = byId('adjSelectedCard');
+    let suggestions = [];
+    let activeIdx = -1;
+    let debounceTimer = null;
+
+    const getSelectedTask = () =>
+      adjSelectedTaskId ? planner.tasks.find(t => String(t.id) === String(adjSelectedTaskId)) : null;
+
+    const renderSelectedCard = () => {
+      const task = getSelectedTask();
+      if (!task) { selectedCard.innerHTML = ''; return; }
+      const existing = findAdjustmentForTask(planner, task);
+      selectedCard.innerHTML = `
+        <div class="adjust-selected">
+          <div class="adjust-selected__head">
+            <strong>Tarefa selecionada</strong>
+            <button type="button" class="btn-clear" id="btnClearAdjTask">Trocar tarefa</button>
+          </div>
+          <p class="adjust-selected__name">${escapeHtml(task.name)}</p>
+          <p class="adjust-selected__meta">
+            ${taskMetaLine(task) ? taskMetaLine(task) + ' · ' : ''}<span class="adjust-original__id">ID: ${escapeHtml(String(task.id))}</span>
+          </p>
+          <p class="adjust-selected__dates">
+            <strong>Dados originais do Excel:</strong>
+            Início ${formatDate(task.start_date)} · Previsão ${formatDate(task.due_date)} · Conclusão ${formatDate(task.completed_at)}
+          </p>
+          ${existing && existing.id !== state.editingAdjustmentId
+            ? '<p class="adjust-original__warn">Esta atividade já possui um ajuste — salvar irá atualizá-lo.</p>' : ''}
+        </div>
+      `;
+      const clearBtn = byId('btnClearAdjTask');
+      if (clearBtn) clearBtn.onclick = () => {
+        adjSelectedTaskId = null;
+        selectedCard.innerHTML = '';
+        searchInput.value = '';
+        searchInput.focus();
+      };
+    };
+
+    const hideSuggestions = () => {
+      suggestBox.hidden = true;
+      suggestBox.innerHTML = '';
+      suggestions = [];
+      activeIdx = -1;
+    };
+
+    const selectTask = task => {
+      adjSelectedTaskId = task.id;
+      searchInput.value = task.name;
+      hideSuggestions();
+      renderSelectedCard();
+    };
+
+    const renderSuggestions = () => {
+      if (!suggestions.length) {
+        const q = searchInput.value.trim();
+        suggestBox.innerHTML = q.length >= 2
+          ? '<div class="adjust-suggestion adjust-suggestion--empty">Nenhuma tarefa encontrada.</div>' : '';
+        suggestBox.hidden = !suggestBox.innerHTML;
+        return;
+      }
+      suggestBox.innerHTML = suggestions.map((t, i) => `
+        <div class="adjust-suggestion ${i === activeIdx ? 'active' : ''}" data-suggest-idx="${i}">
+          <p class="adjust-suggestion__name">${escapeHtml(t.name)}</p>
+          ${taskMetaLine(t) ? `<p class="adjust-suggestion__meta">${taskMetaLine(t)}</p>` : ''}
+        </div>`).join('');
+      suggestBox.hidden = false;
+      const activeEl = suggestBox.querySelector('.adjust-suggestion.active');
+      if (activeEl) activeEl.scrollIntoView({ block: 'nearest' });
+      // mousedown para vencer o blur do input
+      suggestBox.querySelectorAll('[data-suggest-idx]').forEach(el => {
+        el.onmousedown = e => {
+          e.preventDefault();
+          selectTask(suggestions[+el.getAttribute('data-suggest-idx')]);
+        };
+      });
+    };
+
+    const allSorted = planner.tasks.slice().sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+
+    // Combobox: sem texto (ou com a tarefa já selecionada) mostra a LISTA COMPLETA; digitando, filtra
+    const listFor = () => {
+      const task = getSelectedTask();
+      const q = task && searchInput.value === task.name ? '' : searchInput.value;
+      return q.trim() ? searchTasks(planner.tasks, q, 50) : allSorted;
+    };
+
+    const runSearch = () => {
+      suggestions = listFor();
+      activeIdx = -1;
+      renderSuggestions();
+    };
+
+    if (searchInput) {
+      searchInput.oninput = () => {
+        // Digitar de novo invalida a seleção anterior
+        const task = getSelectedTask();
+        if (task && searchInput.value !== task.name) {
+          adjSelectedTaskId = null;
+          selectedCard.innerHTML = '';
+        }
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(runSearch, 120);
+      };
+      searchInput.onfocus = runSearch;
+      searchInput.onblur = () => setTimeout(hideSuggestions, 150);
+      const arrow = byId('adjComboArrow');
+      if (arrow) arrow.onmousedown = e => {
+        e.preventDefault();
+        if (suggestBox.hidden) { searchInput.focus(); runSearch(); }
+        else hideSuggestions();
+      };
+      searchInput.onkeydown = e => {
+        if (suggestBox.hidden && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) { runSearch(); return; }
+        if (e.key === 'ArrowDown') { e.preventDefault(); activeIdx = Math.min(activeIdx + 1, suggestions.length - 1); renderSuggestions(); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); activeIdx = Math.max(activeIdx - 1, 0); renderSuggestions(); }
+        else if (e.key === 'Enter') {
+          e.preventDefault();
+          if (suggestions.length) selectTask(suggestions[activeIdx >= 0 ? activeIdx : 0]);
+        }
+        else if (e.key === 'Escape') hideSuggestions();
+      };
+    }
+    if (searchInput) renderSelectedCard();
+
+    const saveBtn = byId('btnSaveAdjustment');
+    if (saveBtn) saveBtn.onclick = () => {
+      adjustMessage = null;
+      const task = getSelectedTask();
+      if (!task) {
+        adjustMessage = { type: 'error', text: 'Busque e selecione a tarefa que deseja ajustar.' };
+        renderAdjustmentsTab();
+        return;
+      }
+      const start = byId('adjStart').value || null;
+      const due = byId('adjDue').value || null;
+      const done = byId('adjDone').value || null;
+      if (!start && !due && !done) {
+        adjustMessage = { type: 'error', text: 'Informe pelo menos uma data (início, previsão ou fim) para o ajuste.' };
+        renderAdjustmentsTab();
+        return;
+      }
+
+      const existing = state.editingAdjustmentId
+        ? (planner.adjustments || []).find(a => a.id === state.editingAdjustmentId)
+        : findAdjustmentForTask(planner, task);
+
+      // Auditoria: quem registrou e quando (dados originais ficam preservados na tarefa)
+      const nowIso = new Date().toISOString();
+      const me = auth.user || {};
+      saveAdjustment(planner, {
+        id: existing ? existing.id : 'adj_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
+        taskId: String(task.id),
+        taskName: task.name,
+        start_date: start,
+        due_date: due,
+        completed_at: done,
+        note: byId('adjNote').value.trim(),
+        responsible: byId('adjResponsible').value.trim(),
+        adjustedAt: byId('adjDate').value || toInputDate(new Date()),
+        createdById: existing && existing.createdById ? existing.createdById : (me.id || null),
+        createdByName: existing && existing.createdByName ? existing.createdByName : (me.fullName || me.username || null),
+        createdAtIso: existing && existing.createdAtIso ? existing.createdAtIso : nowIso,
+        updatedById: me.id || null,
+        updatedByName: me.fullName || me.username || null,
+        updatedAtIso: nowIso,
+      });
+
+      state.editingAdjustmentId = null;
+      adjSelectedTaskId = null;
+      adjustMessage = { type: 'success', text: `Ajuste de "${task.name}" salvo — já aplicado a todas as análises do dashboard.` };
+      renderAll();
+    };
+
+    const cancelBtn = byId('btnCancelAdjustment');
+    if (cancelBtn) cancelBtn.onclick = () => {
+      state.editingAdjustmentId = null;
+      adjSelectedTaskId = null;
+      adjustMessage = null;
+      renderAdjustmentsTab();
+    };
+
+    document.querySelectorAll('[data-adj-edit]').forEach(btn => {
+      btn.onclick = () => {
+        state.editingAdjustmentId = btn.getAttribute('data-adj-edit');
+        adjustMessage = null;
+        renderAdjustmentsTab();
+      };
+    });
+
+    document.querySelectorAll('[data-adj-remove]').forEach(btn => {
+      btn.onclick = () => {
+        const id = btn.getAttribute('data-adj-remove');
+        const adj = (planner.adjustments || []).find(a => a.id === id);
+        if (!adj) return;
+        if (!confirm(`Excluir o ajuste de "${adj.taskName}"? As análises voltarão a usar os dados originais do Excel.`)) return;
+        removeAdjustment(planner, id);
+        if (state.editingAdjustmentId === id) state.editingAdjustmentId = null;
+        adjustMessage = null;
+        renderAll();
+      };
+    });
+  }
+
+  /* ============================================================
+     Tab: Administração — gerenciamento de usuários (somente Admin)
+     ============================================================ */
+  let adminMessage = null;
+
+  function roleBadge(role) {
+    const def = ROLE_DEFS[role] || ROLE_DEFS.viewer;
+    return `<span class="badge-pill" style="background:${def.color}18;color:${def.color}">${def.label}</span>`;
+  }
+
+  function renderAdminTab() {
+    const root = document.getElementById('adminRoot');
+    if (!root) return;
+    if (!isAdmin()) {
+      root.innerHTML = '<div class="empty-state">Acesso restrito a administradores.</div>';
+      return;
+    }
+    const editing = state.editingUserId ? auth.users.find(u => u.id === state.editingUserId) : null;
+
+    root.innerHTML = `
+      <div class="planners-header">
+        <div>
+          <h2 class="section-title" style="margin-bottom:.25rem">Administração</h2>
+          <p class="section-subtitle">Gerenciamento de usuários — crie, edite e ative/desative os acessos ao sistema. As alterações são sincronizadas em tempo real com as sessões ativas.</p>
+        </div>
+      </div>
+
+      <div class="adjust-form-card">
+        <h3 class="adjust-form-title">${editing ? `Editar usuário — ${escapeHtml(editing.username)}` : 'Criar usuário'}</h3>
+        <div class="adjust-form-grid">
+          <div class="adjust-field">
+            <label>Nome de usuário *</label>
+            <input type="text" id="adminUsername" placeholder="Identificador usado no login" maxlength="40" autocomplete="off" spellcheck="false" value="${editing ? escapeHtml(editing.username) : ''}" />
+          </div>
+          <div class="adjust-field">
+            <label>Nome completo *</label>
+            <input type="text" id="adminFullName" placeholder="Nome real/apresentação" maxlength="80" value="${editing ? escapeHtml(editing.fullName || '') : ''}" />
+          </div>
+          <div class="adjust-field">
+            <label>Área de atuação</label>
+            <input type="text" id="adminArea" placeholder="ex.: Marketing" maxlength="60" value="${editing ? escapeHtml(editing.area || '') : ''}" />
+          </div>
+          <div class="adjust-field">
+            <label>E-mail</label>
+            <input type="email" id="adminEmail" placeholder="Opcional — usado na recuperação de senha" maxlength="120" value="${editing ? escapeHtml(editing.email || '') : ''}" />
+          </div>
+          <div class="adjust-field">
+            <label>Perfil *</label>
+            <select id="adminRole">
+              ${Object.entries(ROLE_DEFS).map(([key, def]) =>
+                `<option value="${key}" ${editing && editing.role === key ? 'selected' : (!editing && key === 'viewer' ? 'selected' : '')}>${def.label}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+        ${adminMessage ? `
+        <div class="upload-message ${adminMessage.type}">
+          ${adminMessage.type === 'success' ? ICONS.checkCircle : ICONS.alertCircle}
+          <p>${escapeHtml(adminMessage.text)}</p>
+        </div>` : ''}
+        <div class="adjust-actions">
+          ${editing ? '<button class="btn-secondary subtle" id="btnCancelUser">Cancelar</button>' : ''}
+          <button class="btn-primary" id="btnSaveUser">${editing ? 'Salvar alterações' : 'Criar usuário'}</button>
+        </div>
+      </div>
+
+      <h3 class="section-title" style="font-size:1.05rem;margin-top:2rem">Usuários cadastrados (${auth.users.length})</h3>
+      ${auth.users.length === 0
+        ? '<div class="empty-state">Nenhum usuário cadastrado.</div>'
+        : `
+      <div class="compare-table-card">
+        <div class="table-scroll">
+          <table class="compare-table">
+            <thead>
+              <tr>
+                <th>Nome de Usuário</th><th>Nome Completo</th><th>Área de Atuação</th><th>E-mail</th><th>Perfil</th><th>Senha</th><th>Status</th><th>Criado em</th><th></th>
+              </tr>
+            </thead>
+            <tbody>
+              ${auth.users.map(u => `
+                <tr class="${u.active === false ? 'user-row--inactive' : ''}">
+                  <td><strong>${escapeHtml(u.username)}</strong>${auth.user.id === u.id ? ' <span class="tag-neutral">você</span>' : ''}</td>
+                  <td>${escapeHtml(u.fullName || '—')}</td>
+                  <td>${escapeHtml(u.area || '—')}</td>
+                  <td>${escapeHtml(u.email || '—')}</td>
+                  <td>${roleBadge(u.role)}</td>
+                  <td>
+                    ${u.pass
+                      ? `<span class="badge-pill" style="background:${COLORS.success}18;color:${COLORS.success}">Senha cadastrada</span>`
+                      : `<span class="badge-pill" style="background:${COLORS.warning}18;color:${COLORS.warning}">Sem senha</span>`}
+                    ${u.resetRequestedAt ? `<span class="badge-pill badge-reset-req" title="Recuperação solicitada em ${new Date(u.resetRequestedAt).toLocaleString('pt-BR')}">Recuperação solicitada</span>` : ''}
+                    ${u.resetToken ? `<span class="badge-pill badge-reset-req" title="Token expira em ${new Date(u.resetToken.expiresAt).toLocaleString('pt-BR')}">Token ativo</span>` : ''}
+                  </td>
+                  <td>${u.active === false
+                    ? `<span class="badge-pill" style="background:${COLORS.error}18;color:${COLORS.error}">Inativo</span>`
+                    : `<span class="badge-pill" style="background:${COLORS.success}18;color:${COLORS.success}">Ativo</span>`}</td>
+                  <td>${formatDate(u.createdAt)}</td>
+                  <td>
+                    <div class="admin-row-actions">
+                      <button class="icon-btn" data-user-edit="${u.id}" title="Editar usuário">${ICONS.pencil}</button>
+                      ${emailValid(u.email) ? `<button class="btn-secondary subtle btn-toggle-user" data-user-sendtoken="${u.id}" title="Gera um token temporário (30 min, uso único) e abre o e-mail para envio — a senha atual nunca é enviada">Enviar token</button>` : ''}
+                      ${u.pass || u.resetRequestedAt ? `<button class="btn-secondary subtle btn-toggle-user" data-user-resetpass="${u.id}" title="A conta volta ao estado Sem senha — a senha atual nunca é exibida">Resetar senha</button>` : ''}
+                      <button class="btn-secondary subtle btn-toggle-user" data-user-toggle="${u.id}">${u.active === false ? 'Ativar' : 'Desativar'}</button>
+                      ${auth.user.id !== u.id ? `<button class="icon-btn danger" data-user-delete="${u.id}" title="Excluir usuário">${ICONS.trash}</button>` : ''}
+                    </div>
+                  </td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>`}
+
+      <h3 class="section-title" style="font-size:1.05rem;margin-top:2rem">Arquivos importados por usuário</h3>
+      <p class="section-subtitle" style="margin-bottom:1rem">Função administrativa — visão geral dos arquivos de cada usuário. Não altera o seu dashboard pessoal, que mostra somente os seus arquivos.</p>
+      <div id="adminFilesRoot"><div class="empty-state">Carregando arquivos...</div></div>
+
+      <h3 class="section-title" style="font-size:1.05rem;margin-top:2rem">Histórico de atividades</h3>
+      <p class="section-subtitle" style="margin-bottom:1rem">Rastreabilidade das ações realizadas no sistema — senhas e tokens nunca são registrados.</p>
+      <div id="auditRoot"><div class="empty-state">Carregando histórico...</div></div>
+    `;
+
+    bindAdminTab();
+    loadAdminFilesOverview();
+    loadAuditLog();
+  }
+
+  // Função administrativa: metadados dos arquivos de todos os usuários (sem carregar as tarefas)
+  async function loadAdminFilesOverview() {
+    const root = document.getElementById('adminFilesRoot');
+    if (!root) return;
+    if (!isAdmin() || !cloud.db) { root.innerHTML = '<div class="empty-state">Indisponível.</div>'; return; }
+    try {
+      const snap = await cloud.db.collection('planners').get();
+      const el = document.getElementById('adminFilesRoot');
+      if (!el) return;
+      if (snap.empty) { el.innerHTML = '<div class="empty-state">Nenhum arquivo importado no sistema.</div>'; return; }
+      const rows = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+        .sort((a, b) => String(a.ownerUsername || '').localeCompare(String(b.ownerUsername || '')) || String(a.addedAt || '').localeCompare(String(b.addedAt || '')));
+      el.innerHTML = `
+        <div class="compare-table-card">
+          <div class="table-scroll">
+            <table class="compare-table audit-table">
+              <thead>
+                <tr><th>Usuário</th><th>Planner</th><th>Arquivo</th><th>Tarefas</th><th>Versão</th><th>Importado em</th><th>Última atualização</th></tr>
+              </thead>
+              <tbody>
+                ${rows.map(p => `
+                <tr>
+                  <td><strong>${escapeHtml(p.ownerUsername || '(sem dono)')}</strong></td>
+                  <td>${escapeHtml(p.name || '—')}</td>
+                  <td class="audit-cell" title="${escapeHtml(p.fileName || '')}">${escapeHtml(p.fileName || '—')}</td>
+                  <td>${p.taskCount != null ? p.taskCount : '—'}</td>
+                  <td>${p.version || 1}</td>
+                  <td>${formatDate(p.addedAt)}</td>
+                  <td>${p.updatedAt ? new Date(p.updatedAt).toLocaleString('pt-BR') : '—'}</td>
+                </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    } catch (e) {
+      console.warn('Falha ao carregar arquivos por usuário.', e);
+      const el = document.getElementById('adminFilesRoot');
+      if (el) el.innerHTML = '<div class="empty-state">Não foi possível carregar os arquivos.</div>';
+    }
+  }
+
+  async function loadAuditLog() {
+    const root = document.getElementById('auditRoot');
+    if (!root) return;
+    if (!cloud.db) { root.innerHTML = '<div class="empty-state">Histórico disponível apenas com a nuvem conectada.</div>'; return; }
+    try {
+      const snap = await cloud.db.collection('audit').orderBy('atIso', 'desc').limit(50).get();
+      if (!document.getElementById('auditRoot')) return;
+      if (snap.empty) { document.getElementById('auditRoot').innerHTML = '<div class="empty-state">Nenhuma atividade registrada ainda.</div>'; return; }
+      document.getElementById('auditRoot').innerHTML = `
+        <div class="compare-table-card">
+          <div class="table-scroll deadline-table-scroll">
+            <table class="compare-table audit-table">
+              <thead>
+                <tr><th>Data / Hora</th><th>Usuário</th><th>Perfil</th><th>Ação</th><th>Alvo</th><th>Antes</th><th>Depois</th></tr>
+              </thead>
+              <tbody>
+                ${snap.docs.map(d => {
+                  const a = d.data();
+                  return `
+                  <tr>
+                    <td>${a.atIso ? new Date(a.atIso).toLocaleString('pt-BR') : '—'}</td>
+                    <td title="${escapeHtml(a.fullName || '')}">${escapeHtml(a.username || '—')}</td>
+                    <td>${a.role ? roleBadge(a.role) : '—'}</td>
+                    <td>${escapeHtml(a.action || '—')}</td>
+                    <td class="audit-cell" title="${escapeHtml(a.target || '')}">${escapeHtml(a.target || '—')}</td>
+                    <td class="audit-cell" title="${escapeHtml(a.before || '')}">${escapeHtml(a.before || '—')}</td>
+                    <td class="audit-cell" title="${escapeHtml(a.after || '')}">${escapeHtml(a.after || '—')}</td>
+                  </tr>`;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    } catch (e) {
+      console.warn('Falha ao carregar histórico.', e);
+      const el = document.getElementById('auditRoot');
+      if (el) el.innerHTML = '<div class="empty-state">Não foi possível carregar o histórico.</div>';
+    }
+  }
+
+  function bindAdminTab() {
+    const byId = id => document.getElementById(id);
+
+    byId('btnSaveUser').onclick = async () => {
+      adminMessage = null;
+      const payload = {
+        username: byId('adminUsername').value,
+        fullName: byId('adminFullName').value,
+        area: byId('adminArea').value,
+        email: byId('adminEmail').value.trim(),
+        role: byId('adminRole').value,
+      };
+      try {
+        if (!payload.username.trim()) throw new Error('Informe o nome de usuário.');
+        if (!payload.fullName.trim()) throw new Error('Informe o nome completo.');
+        if (state.editingUserId) {
+          await updateUser(state.editingUserId, payload);
+          adminMessage = { type: 'success', text: `Usuário "${payload.username.trim()}" atualizado.` };
+        } else {
+          await createUser(payload);
+          adminMessage = { type: 'success', text: `Usuário "${payload.username.trim()}" criado — já pode entrar pelo botão Login.` };
+        }
+        state.editingUserId = null;
+      } catch (e) {
+        adminMessage = { type: 'error', text: e.message || 'Não foi possível salvar o usuário.' };
+      }
+      renderAdminTab();
+    };
+
+    const cancelBtn = byId('btnCancelUser');
+    if (cancelBtn) cancelBtn.onclick = () => {
+      state.editingUserId = null;
+      adminMessage = null;
+      renderAdminTab();
+    };
+
+    document.querySelectorAll('[data-user-edit]').forEach(btn => {
+      btn.onclick = () => {
+        state.editingUserId = btn.getAttribute('data-user-edit');
+        adminMessage = null;
+        renderAdminTab();
+        const input = byId('adminUsername');
+        if (input) input.focus();
+      };
+    });
+
+    document.querySelectorAll('[data-user-delete]').forEach(btn => {
+      btn.onclick = async () => {
+        adminMessage = null;
+        const id = btn.getAttribute('data-user-delete');
+        const u = auth.users.find(x => x.id === id);
+        if (!u) return;
+        if (!confirm(`Excluir o usuário "${u.username}" (${u.fullName || '—'})? Essa ação não pode ser desfeita — se preferir manter o histórico, use "Desativar".`)) return;
+        try {
+          await deleteUser(id);
+          if (state.editingUserId === id) state.editingUserId = null;
+          adminMessage = { type: 'success', text: `Usuário "${u.username}" excluído.` };
+        } catch (e) {
+          adminMessage = { type: 'error', text: e.message || 'Não foi possível excluir o usuário.' };
+        }
+        if (state.activeTab === 'admin') renderAdminTab();
+      };
+    });
+
+    document.querySelectorAll('[data-user-sendtoken]').forEach(btn => {
+      btn.onclick = async () => {
+        adminMessage = null;
+        const id = btn.getAttribute('data-user-sendtoken');
+        const u = auth.users.find(x => x.id === id);
+        if (!u) return;
+        try {
+          const token = await issueResetToken(id);
+          // Entrega por e-mail via cliente do Admin — o token não é persistido nem exibido na interface
+          const subject = encodeURIComponent('Orquestrador de Tarefas — Token de recuperação de senha');
+          const body = encodeURIComponent(
+            `Olá, ${u.fullName || u.username}!\n\n` +
+            `Use o token abaixo para redefinir sua senha no Orquestrador de Tarefas ` +
+            `(tela de Login → "Esqueci minha senha" → "Já tenho um token"):\n\n` +
+            `TOKEN: ${token}\n\n` +
+            `Ele é válido por 30 minutos e só pode ser usado uma vez.`);
+          window.open(`mailto:${encodeURIComponent(u.email)}?subject=${subject}&body=${body}`);
+          adminMessage = { type: 'success', text: `Token gerado para "${u.username}" — finalize o envio no seu aplicativo de e-mail.` };
+        } catch (e) {
+          adminMessage = { type: 'error', text: e.message || 'Não foi possível gerar o token.' };
+        }
+        if (state.activeTab === 'admin') renderAdminTab();
+      };
+    });
+
+    document.querySelectorAll('[data-user-resetpass]').forEach(btn => {
+      btn.onclick = async () => {
+        adminMessage = null;
+        const id = btn.getAttribute('data-user-resetpass');
+        const u = auth.users.find(x => x.id === id);
+        if (!u) return;
+        if (!confirm(`Resetar a senha de "${u.username}"? A conta voltará ao estado "Sem senha" e o usuário poderá entrar somente com o nome de usuário para definir uma nova.`)) return;
+        try {
+          await resetPassword(id);
+          adminMessage = { type: 'success', text: `Senha de "${u.username}" resetada — conta sem senha.` };
+        } catch (e) {
+          adminMessage = { type: 'error', text: e.message || 'Não foi possível resetar a senha.' };
+        }
+        if (state.activeTab === 'admin') renderAdminTab();
+      };
+    });
+
+    document.querySelectorAll('[data-user-toggle]').forEach(btn => {
+      btn.onclick = async () => {
+        adminMessage = null;
+        const id = btn.getAttribute('data-user-toggle');
+        const u = auth.users.find(x => x.id === id);
+        if (!u) return;
+        const deactivating = u.active !== false;
+        if (deactivating && auth.user.id === id &&
+            !confirm('Desativar o seu próprio usuário encerrará a sua sessão. Continuar?')) return;
+        try {
+          await updateUser(id, { active: !deactivating ? true : false });
+          adminMessage = { type: 'success', text: `Usuário "${u.username}" ${deactivating ? 'desativado' : 'ativado'}.` };
+        } catch (e) {
+          adminMessage = { type: 'error', text: e.message || 'Não foi possível alterar o status.' };
+        }
+        if (state.activeTab === 'admin') renderAdminTab();
+      };
+    });
+  }
+
+  /* ============================================================
      Render geral
      ============================================================ */
   function renderAll() {
@@ -2083,11 +3665,35 @@
 
     renderPanel();
 
+    // Sem login não há espaço de dados; logado sem arquivos, orienta a importar
+    const TAB_ROOTS = { metrics: 'metricsRoot', gantt: 'ganttRoot', tasks: 'tasksRoot', compare: 'compareRoot' };
+    if (TAB_ROOTS[state.activeTab] && (!auth.user || !state.planners.length)) {
+      destroyCharts();
+      Object.values(state.compareCharts).forEach(c => c && c.destroy());
+      state.compareCharts = {};
+      document.getElementById(TAB_ROOTS[state.activeTab]).innerHTML = `
+        <div class="empty-state">
+          ${!auth.user
+            ? '<p style="margin:0 0 1rem">Faça login para acessar os seus arquivos, análises e ajustes.</p><button class="btn-primary" id="btnEmptyLogin">Entrar</button>'
+            : `<p style="margin:0${can('managePlanners') ? ' 0 1rem' : ''}">Você ainda não importou nenhum arquivo.</p>${can('managePlanners') ? '<button class="btn-primary" id="btnEmptyImport">Importar meu primeiro Excel</button>' : ''}`}
+        </div>`;
+      const loginBtn = document.getElementById('btnEmptyLogin');
+      if (loginBtn) loginBtn.onclick = openLoginScreen;
+      const importBtn = document.getElementById('btnEmptyImport');
+      if (importBtn) importBtn.onclick = () => {
+        const tabBtn = document.querySelector('.tab-trigger[data-tab="planners"]');
+        if (tabBtn) tabBtn.click();
+      };
+      return;
+    }
+
     if (state.activeTab === 'metrics') renderMetrics(filtered);
     if (state.activeTab === 'gantt') renderGantt(filtered);
     if (state.activeTab === 'tasks') renderTasksCards(filtered);
     if (state.activeTab === 'planners') renderPlannersTab();
+    if (state.activeTab === 'adjustments') renderAdjustmentsTab();
     if (state.activeTab === 'compare') renderCompareTab();
+    if (state.activeTab === 'admin') renderAdminTab();
   }
 
   /* ============================================================
@@ -2121,14 +3727,366 @@
   }
 
   /* ============================================================
+     Controle de acesso na interface (abas por perfil)
+     - Anônimo/Visualizador: consulta (dashboards, filtros, comparações)
+     - Editor: experiência simplificada — somente registro de ajustes
+     - Admin: tudo + Administração
+     ============================================================ */
+  function visibleTabs() {
+    const role = auth.user ? auth.user.role : null;
+    if (role === 'admin') return ['metrics', 'gantt', 'tasks', 'planners', 'adjustments', 'compare', 'admin'];
+    if (role === 'editor') return ['adjustments', 'planners'];
+    if (role === 'viewer') return ['metrics', 'gantt', 'tasks', 'planners', 'adjustments', 'compare'];
+    return ['metrics', 'gantt', 'tasks', 'adjustments', 'compare']; // anônimo: telas com convite ao login
+  }
+
+  function applyAccessUI() {
+    const visible = visibleTabs();
+    if (!visible.includes(state.activeTab)) state.activeTab = visible[0];
+    document.querySelectorAll('.tab-trigger').forEach(btn => {
+      const tab = btn.getAttribute('data-tab');
+      btn.style.display = visible.includes(tab) ? '' : 'none';
+      btn.classList.toggle('active', tab === state.activeTab);
+    });
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + state.activeTab));
+    renderUserArea();
+    renderAll();
+  }
+
+  /* ============================================================
+     Área do usuário no header (Login / usuário logado + Sair)
+     ============================================================ */
+  const AUTH_ICONS = {
+    user: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+    logout: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>',
+  };
+
+  function userInitials(user) {
+    const src = (user.fullName || user.username || '?').trim();
+    const parts = src.split(/\s+/);
+    return (parts[0][0] + (parts.length > 1 ? parts[parts.length - 1][0] : '')).toUpperCase();
+  }
+
+  function renderUserArea() {
+    const el = document.getElementById('userArea');
+    if (!el) return;
+    if (!auth.user) {
+      el.innerHTML = `<button class="btn-login" id="btnLogin">${AUTH_ICONS.user}<span>Login</span></button>`;
+      document.getElementById('btnLogin').onclick = openLoginScreen;
+      return;
+    }
+    const role = ROLE_DEFS[auth.user.role] || ROLE_DEFS.viewer;
+    el.innerHTML = `
+      <button class="user-chip" id="btnMyAccount" title="Minha Conta">
+        <span class="user-chip__avatar" style="background:${role.color}20;color:${role.color}">${escapeHtml(userInitials(auth.user))}</span>
+        <span class="user-chip__info">
+          <span class="user-chip__name">${escapeHtml(auth.user.fullName || auth.user.username)}</span>
+          <span class="user-chip__role" style="color:${role.color}">${role.label}</span>
+        </span>
+      </button>
+      <button class="btn-logout" id="btnLogout" title="Sair">${AUTH_ICONS.logout}<span>Sair</span></button>
+    `;
+    document.getElementById('btnMyAccount').onclick = () => openAccountScreen();
+    document.getElementById('btnLogout').onclick = logout;
+  }
+
+  /* ============================================================
+     Tela de Login — usuário + senha (contas sem senha entram só
+     com o usuário) e recuperação de senha
+     ============================================================ */
+  let loginError = null;
+  let loginMode = 'login'; // 'login' | 'forgot' | 'token'
+  let loginInfo = null;
+
+  function openLoginScreen() {
+    loginError = null;
+    loginInfo = null;
+    loginMode = 'login';
+    document.getElementById('loginScreen').classList.remove('hidden');
+    renderLoginScreen();
+  }
+
+  function closeLoginScreen() {
+    document.getElementById('loginScreen').classList.add('hidden');
+  }
+
+  function renderLoginScreen() {
+    const card = document.getElementById('loginCard');
+    const forgot = loginMode === 'forgot';
+    const tokenMode = loginMode === 'token';
+
+    const titles = {
+      login: ['Entrar no Orquestrador', 'Informe o nome de usuário cadastrado. Se a conta tiver senha, ela também será solicitada.'],
+      forgot: ['Recuperação de senha', 'Informe seu nome de usuário. Um administrador enviará um token temporário para o seu e-mail cadastrado — a senha atual nunca é enviada.'],
+      token: ['Redefinir senha com token', 'Use o token recebido por e-mail (válido por 30 minutos, uso único) para criar uma nova senha.'],
+    };
+
+    card.innerHTML = `
+      <button class="modal-close login-close" id="loginClose" title="Fechar">${ICONS.x}</button>
+      <div class="login-brand">
+        <span class="app-logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4"/><path d="M12 18v4"/><path d="M4.93 4.93l2.83 2.83"/><path d="M16.24 16.24l2.83 2.83"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M4.93 19.07l2.83-2.83"/><path d="M16.24 7.76l2.83-2.83"/></svg>
+        </span>
+        <h2>${titles[loginMode][0]}</h2>
+        <p>${titles[loginMode][1]}</p>
+      </div>
+      <div class="login-fields">
+        <div class="adjust-field">
+          <label>Nome de usuário</label>
+          <input type="text" id="loginUsername" placeholder="ex.: rafael" autocomplete="username" spellcheck="false" maxlength="40" />
+        </div>
+        ${loginMode === 'login' ? `
+        <div class="adjust-field">
+          <label>Senha</label>
+          <input type="password" id="loginPassword" placeholder="Deixe em branco se a conta não tem senha" autocomplete="current-password" maxlength="80" />
+        </div>` : ''}
+        ${tokenMode ? `
+        <div class="adjust-field">
+          <label>Token recebido por e-mail</label>
+          <input type="text" id="loginToken" placeholder="XXXX-XXXX" autocomplete="one-time-code" spellcheck="false" maxlength="12" />
+        </div>
+        <div class="adjust-field">
+          <label>Nova senha</label>
+          <input type="password" id="loginNewPass" placeholder="Mínimo de 4 caracteres" autocomplete="new-password" maxlength="80" />
+        </div>
+        <div class="adjust-field">
+          <label>Confirmar nova senha</label>
+          <input type="password" id="loginNewPass2" autocomplete="new-password" maxlength="80" />
+        </div>` : ''}
+      </div>
+      ${loginError ? `<p class="login-error">${escapeHtml(loginError)}</p>` : ''}
+      ${loginInfo ? `<p class="login-info">${escapeHtml(loginInfo)}</p>` : ''}
+      <button class="btn-primary login-submit" id="loginSubmit">${tokenMode ? 'Redefinir senha' : forgot ? 'Solicitar recuperação' : 'Entrar'}</button>
+      <p class="login-hint">
+        ${loginMode === 'login'
+          ? '<a href="#" data-login-mode="forgot">Esqueci minha senha</a>'
+          : forgot
+            ? '<a href="#" data-login-mode="token">Já tenho um token</a> · <a href="#" data-login-mode="login">← Voltar ao login</a>'
+            : '<a href="#" data-login-mode="login">← Voltar ao login</a>'}
+      </p>
+    `;
+
+    document.getElementById('loginClose').onclick = closeLoginScreen;
+    card.querySelectorAll('[data-login-mode]').forEach(a => {
+      a.onclick = e => {
+        e.preventDefault();
+        loginMode = a.getAttribute('data-login-mode');
+        loginError = null;
+        loginInfo = null;
+        renderLoginScreen();
+      };
+    });
+    const input = document.getElementById('loginUsername');
+    input.focus();
+
+    const submit = async () => {
+      loginError = null;
+      loginInfo = null;
+      const uname = input.value.trim();
+      if (!uname) { loginError = 'Informe o nome de usuário.'; renderLoginScreen(); return; }
+      const norm = normalizeUsername(uname);
+      const user = auth.users.find(u => u.usernameNorm === norm);
+
+      if (forgot) {
+        try {
+          if (user) {
+            await persistUserDoc({ ...user, resetRequestedAt: new Date().toISOString() });
+            logAudit('Recuperação de senha solicitada', user.username, '', user.email ? `e-mail cadastrado: ${user.email}` : 'conta sem e-mail');
+          }
+          loginInfo = 'Solicitação registrada. Um administrador poderá enviar um token para o seu e-mail cadastrado ou resetar sua senha.';
+        } catch (e) {
+          loginError = 'Não foi possível registrar a solicitação.';
+        }
+        renderLoginScreen();
+        return;
+      }
+
+      if (tokenMode) {
+        const token = document.getElementById('loginToken').value;
+        const nova = document.getElementById('loginNewPass').value;
+        const conf = document.getElementById('loginNewPass2').value;
+        try {
+          if (!normalizeToken(token)) throw new Error('Informe o token recebido por e-mail.');
+          if (nova.length < 4) throw new Error('A nova senha deve ter pelo menos 4 caracteres.');
+          if (nova !== conf) throw new Error('A confirmação não confere com a nova senha.');
+          await redeemResetToken(uname, token, nova);
+          loginMode = 'login';
+          loginInfo = 'Senha redefinida com sucesso — entre com sua nova senha.';
+        } catch (e) {
+          loginError = e.message || 'Não foi possível redefinir a senha.';
+        }
+        renderLoginScreen();
+        return;
+      }
+
+      const pwd = document.getElementById('loginPassword').value;
+      try {
+        // Primeiro acesso administrativo: credencial inicial de configuração
+        if (!user && norm === BOOTSTRAP_ADMIN.username) {
+          if (!pwd) { loginError = 'Informe a senha.'; renderLoginScreen(); return; }
+          const created = await bootstrapAdmin(pwd);
+          if (!created) { loginError = 'Usuário ou senha inválidos.'; renderLoginScreen(); return; }
+          setSession(created);
+          logAudit('Primeiro acesso do administrador configurado', 'admin', '', 'conta admin criada com senha');
+          await switchUserContext();
+          closeLoginScreen();
+          applyAccessUI();
+          openAccountScreen('Primeiro acesso — recomendamos alterar a senha inicial em Segurança.');
+          return;
+        }
+        if (!user) { loginError = 'Usuário não encontrado. Solicite o cadastro a um administrador.'; renderLoginScreen(); return; }
+        if (user.active === false) { loginError = 'Este usuário está desativado. Fale com um administrador.'; renderLoginScreen(); return; }
+        if (user.pass) {
+          if (!pwd) { loginError = 'Informe a senha.'; renderLoginScreen(); return; }
+          if (!(await verifyPassword(user.pass, pwd))) { loginError = 'Usuário ou senha inválidos.'; renderLoginScreen(); return; }
+        }
+        setSession(user);
+        await switchUserContext();
+        closeLoginScreen();
+        applyAccessUI();
+        if (user.firstAccess) openAccountScreen('Primeiro acesso — recomendamos alterar a senha inicial em Segurança.');
+      } catch (e) {
+        loginError = e.message || 'Não foi possível entrar.';
+        renderLoginScreen();
+      }
+    };
+
+    document.getElementById('loginSubmit').onclick = submit;
+    card.querySelectorAll('input').forEach(i => {
+      i.onkeydown = e => { if (e.key === 'Enter') submit(); };
+    });
+  }
+
+  /* ============================================================
+     Minha Conta — dados da conta, e-mail e segurança (senha).
+     Dados estruturais (usuário/nome/área/perfil) são do Admin.
+     ============================================================ */
+  let accountMessage = null;
+  let accountNotice = null;
+
+  function openAccountScreen(notice) {
+    if (!auth.user) return;
+    accountNotice = notice || null;
+    accountMessage = null;
+    document.getElementById('accountScreen').classList.remove('hidden');
+    renderAccountScreen();
+  }
+
+  function closeAccountScreen() {
+    document.getElementById('accountScreen').classList.add('hidden');
+  }
+
+  function renderAccountScreen() {
+    const card = document.getElementById('accountCard');
+    if (!auth.user) { closeAccountScreen(); return; }
+    const u = auth.users.find(x => x.id === auth.user.id) || auth.user;
+    const role = ROLE_DEFS[u.role] || ROLE_DEFS.viewer;
+    const hasPass = !!u.pass;
+    const emailOk = emailValid(u.email);
+
+    card.innerHTML = `
+      <button class="modal-close login-close" id="accountClose" title="Fechar">${ICONS.x}</button>
+      <div class="login-brand" style="margin-bottom:1rem">
+        <h2>Minha Conta</h2>
+      </div>
+      ${accountNotice ? `<p class="login-info" style="margin:0 0 1rem">${escapeHtml(accountNotice)}</p>` : ''}
+      <div class="account-info">
+        <div><span class="account-info__lbl">Usuário</span><span>${escapeHtml(u.username)}</span></div>
+        <div><span class="account-info__lbl">Nome completo</span><span>${escapeHtml(u.fullName || '—')}</span></div>
+        <div><span class="account-info__lbl">Área de atuação</span><span>${escapeHtml(u.area || '—')}</span></div>
+        <div><span class="account-info__lbl">Perfil</span><span class="badge-pill" style="background:${role.color}18;color:${role.color}">${role.label}</span></div>
+        <div><span class="account-info__lbl">Senha</span><span class="badge-pill" style="background:${hasPass ? COLORS.success : COLORS.warning}18;color:${hasPass ? COLORS.success : COLORS.warning}">${hasPass ? 'Senha cadastrada' : 'Sem senha'}</span></div>
+      </div>
+
+      <div class="adjust-field" style="margin-top:1rem">
+        <label>E-mail</label>
+        <div class="account-email-row">
+          <input type="email" id="accEmail" placeholder="seu@email.com" maxlength="120" value="${escapeHtml(u.email || '')}" />
+          <button class="btn-secondary" id="accSaveEmail">Salvar</button>
+        </div>
+      </div>
+
+      <h3 class="account-section-title">Segurança</h3>
+      ${!emailOk ? '<p class="login-error" style="margin:0 0 .9rem">Cadastre um e-mail válido antes de definir uma senha.</p>' : ''}
+      <div class="login-fields">
+        ${hasPass ? `
+        <div class="adjust-field">
+          <label>Senha atual</label>
+          <input type="password" id="accCurrent" autocomplete="current-password" maxlength="80" ${emailOk ? '' : 'disabled'} />
+        </div>` : ''}
+        <div class="adjust-field">
+          <label>Nova senha</label>
+          <input type="password" id="accNew" autocomplete="new-password" maxlength="80" placeholder="Mínimo de 4 caracteres" ${emailOk ? '' : 'disabled'} />
+        </div>
+        <div class="adjust-field">
+          <label>Confirmar nova senha</label>
+          <input type="password" id="accConfirm" autocomplete="new-password" maxlength="80" ${emailOk ? '' : 'disabled'} />
+        </div>
+      </div>
+      ${accountMessage ? `<p class="${accountMessage.type === 'success' ? 'login-info' : 'login-error'}">${escapeHtml(accountMessage.text)}</p>` : ''}
+      <button class="btn-primary login-submit" id="accSavePass" ${emailOk ? '' : 'disabled'} ${emailOk ? '' : 'title="Cadastre um e-mail válido antes de definir uma senha."'}>${hasPass ? 'Alterar senha' : 'Definir senha'}</button>
+    `;
+
+    document.getElementById('accountClose').onclick = closeAccountScreen;
+
+    document.getElementById('accSaveEmail').onclick = async () => {
+      accountMessage = null;
+      accountNotice = null;
+      const email = document.getElementById('accEmail').value.trim();
+      try {
+        const before = u.email || '—';
+        await updateSelfAccount({ email });
+        logAudit('E-mail da conta atualizado', u.username, before, email || '—');
+        accountMessage = { type: 'success', text: 'E-mail salvo.' };
+      } catch (e) {
+        accountMessage = { type: 'error', text: e.message || 'Não foi possível salvar o e-mail.' };
+      }
+      renderAccountScreen();
+    };
+
+    document.getElementById('accSavePass').onclick = async () => {
+      accountMessage = null;
+      accountNotice = null;
+      const nova = document.getElementById('accNew').value;
+      const conf = document.getElementById('accConfirm').value;
+      try {
+        if (!emailOk) throw new Error('Cadastre um e-mail válido antes de definir uma senha.');
+        if (nova.length < 4) throw new Error('A nova senha deve ter pelo menos 4 caracteres.');
+        if (nova !== conf) throw new Error('A confirmação não confere com a nova senha.');
+        if (hasPass) {
+          const atual = document.getElementById('accCurrent').value;
+          if (!(await verifyPassword(u.pass, atual))) throw new Error('Senha atual incorreta.');
+        }
+        await updateSelfAccount({ pass: await hashPassword(nova), firstAccess: false, clearReset: true });
+        logAudit(hasPass ? 'Senha alterada' : 'Senha definida', u.username, hasPass ? 'Senha cadastrada' : 'Sem senha', 'Senha cadastrada');
+        accountMessage = { type: 'success', text: hasPass ? 'Senha alterada com sucesso.' : 'Senha definida com sucesso.' };
+      } catch (e) {
+        accountMessage = { type: 'error', text: e.message || 'Não foi possível salvar a senha.' };
+      }
+      renderAccountScreen();
+    };
+  }
+
+  function logout() {
+    setSession(null);
+    state.editingAdjustmentId = null;
+    state.editingUserId = null;
+    closeAccountScreen();
+    switchUserContext().then(() => applyAccessUI());
+  }
+
+  /* ============================================================
      Inicialização
      ============================================================ */
   async function init() {
     cloudInit();
-    await initData();
+    loadSession();
+    subscribeUsers();
+    await loadDataForCurrentUser();
+    subscribePlanners();
     document.getElementById('loadingScreen').classList.add('hidden');
     populatePlannerSwitcher();
-    renderAll();
+    applyAccessUI();
   }
 
   document.addEventListener('DOMContentLoaded', () => {

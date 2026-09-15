@@ -34,6 +34,7 @@
             <span class="sync-status__text">Conectando...</span>
           </div>
           <select id="plannerSwitcher" class="planner-switcher" title="Alternar planner ativo"></select>
+          <div class="user-area" id="userArea"></div>
         </div>
       </div>
     </header>
@@ -75,9 +76,17 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
               <span>Planners</span>
             </button>
+            <button class="tab-trigger" data-tab="adjustments">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+              <span>Ajustes</span>
+            </button>
             <button class="tab-trigger" data-tab="compare">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="18" rx="1"/><rect x="14" y="3" width="7" height="18" rx="1"/></svg>
               <span>Comparar</span>
+            </button>
+            <button class="tab-trigger" data-tab="admin" style="display:none">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+              <span>Administração</span>
             </button>
           </div>
 
@@ -104,10 +113,20 @@
             <div id="plannersRoot"></div>
           </div>
 
+          <!-- Tab: Ajustes -->
+          <div class="tab-content" id="tab-adjustments">
+            <div id="adjustmentsRoot"></div>
+          </div>
+
           <!-- Tab: Comparar -->
           <div class="tab-content" id="tab-compare">
             <h2 class="section-title">Comparativo entre Planners</h2>
             <div id="compareRoot"></div>
+          </div>
+
+          <!-- Tab: Administração -->
+          <div class="tab-content" id="tab-admin">
+            <div id="adminRoot"></div>
           </div>
 
         </div>
@@ -132,6 +151,16 @@
       </button>
     </div>
     <div class="modal-body" id="modalBody"></div>
+  </div>
+
+  <!-- Login -->
+  <div class="login-screen hidden" id="loginScreen">
+    <div class="login-card" id="loginCard"></div>
+  </div>
+
+  <!-- Minha Conta -->
+  <div class="login-screen hidden" id="accountScreen">
+    <div class="login-card account-card" id="accountCard"></div>
   </div>
 
   <!-- Loading -->

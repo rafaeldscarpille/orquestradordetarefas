@@ -1201,3 +1201,304 @@ svg { display: block; }
   .kpi-card__value { font-size: 1.1rem; }
   .gantt-col-label, .gantt-task-label { width: 145px; }
 }
+
+/* ============================================================
+   Análise de prazos (aba Comparação)
+   ============================================================ */
+.kpi-card--static { cursor: default; }
+.kpi-card--static:hover { transform: none; box-shadow: var(--shadow-xs); border-color: var(--color-border); }
+.kpi-card--static:hover .kpi-card__icon { transform: none; }
+
+.deadline-table-scroll { max-height: 420px; overflow-y: auto; }
+.deadline-table-scroll thead { position: sticky; top: 0; z-index: 1; }
+.deadline-task-name { max-width: 320px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.dev-neg { color: var(--color-success); }
+.dev-pos { color: var(--color-error); }
+.dev-zero { color: var(--color-muted-fg); }
+
+.adjusted-tag {
+  display: inline-block;
+  margin-left: .4rem;
+  padding: .1rem .45rem;
+  border-radius: 999px;
+  font-size: .62rem;
+  font-weight: 600;
+  background: rgba(139,92,246,.12);
+  color: #8B5CF6;
+  vertical-align: middle;
+}
+.adjusted-tag--warn { background: rgba(249,115,22,.12); color: var(--color-warning); }
+
+/* ============================================================
+   Aba Ajustes
+   ============================================================ */
+.adjust-form-card {
+  background: var(--color-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-xs);
+  padding: 1.5rem;
+}
+.adjust-form-title { font-family: var(--font-heading); font-size: 1.02rem; font-weight: 700; margin: 0 0 1.1rem; }
+
+.adjust-form-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+}
+.adjust-field--full { grid-column: 1 / -1; }
+.adjust-field label { display: block; font-size: .8rem; font-weight: 500; margin-bottom: .4rem; }
+.adjust-field input,
+.adjust-field select {
+  width: 100%;
+  padding: .55rem .75rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-card);
+  font-size: .85rem;
+  font-family: inherit;
+  color: var(--color-fg);
+}
+.adjust-field input:focus,
+.adjust-field select:focus { outline: none; border-color: var(--color-primary); }
+.adjust-field select:disabled { background: var(--color-muted); color: var(--color-muted-fg); }
+
+.adjust-original { margin-top: 1rem; font-size: .8rem; color: var(--color-muted-fg); }
+.adjust-original p { margin: 0 0 .25rem; }
+.adjust-original__id { margin-left: .5rem; font-size: .7rem; background: var(--color-muted); padding: .12rem .45rem; border-radius: var(--radius-sm); }
+.adjust-original__warn { color: var(--color-warning); font-weight: 500; }
+
+/* Busca de tarefa com autocomplete (combobox: dropdown + digitação) */
+.adjust-search-wrap { position: relative; }
+.adjust-combo { position: relative; }
+.adjust-combo input { padding-right: 2.2rem; }
+.adjust-combo-arrow {
+  position: absolute;
+  right: .3rem;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  color: var(--color-muted-fg);
+  transition: background .15s, color .15s;
+}
+.adjust-combo-arrow:hover { background: var(--color-muted); color: var(--color-fg); }
+.adjust-combo-arrow svg { width: 16px; height: 16px; }
+.adjust-suggestions {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  background: var(--color-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  max-height: 320px;
+  overflow-y: auto;
+}
+.adjust-suggestion {
+  padding: .6rem .8rem;
+  cursor: pointer;
+  border-bottom: 1px solid var(--color-border);
+  transition: background .12s;
+}
+.adjust-suggestion:last-child { border-bottom: none; }
+.adjust-suggestion:hover,
+.adjust-suggestion.active { background: var(--color-muted); }
+.adjust-suggestion--empty { cursor: default; color: var(--color-muted-fg); font-size: .8rem; }
+.adjust-suggestion--empty:hover { background: transparent; }
+.adjust-suggestion__name { margin: 0; font-size: .85rem; font-weight: 600; color: var(--color-fg); }
+.adjust-suggestion__meta { margin: .2rem 0 0; font-size: .72rem; color: var(--color-muted-fg); }
+
+.adjust-selected {
+  background: rgba(77,141,246,.05);
+  border: 1px solid rgba(77,141,246,.25);
+  border-radius: var(--radius-md);
+  padding: .85rem 1rem;
+}
+.adjust-selected__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .5rem;
+  font-size: .72rem;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--color-primary);
+  margin-bottom: .35rem;
+}
+.adjust-selected__name { margin: 0; font-size: .92rem; font-weight: 600; color: var(--color-fg); }
+.adjust-selected__meta { margin: .3rem 0 0; font-size: .76rem; color: var(--color-muted-fg); }
+.adjust-selected__dates { margin: .45rem 0 0; font-size: .78rem; color: var(--color-muted-fg); }
+
+.adjust-actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: 1.1rem; }
+
+.orig-strike { text-decoration: line-through; color: var(--color-muted-fg); font-size: .78rem; margin-right: .25rem; }
+.adjust-keep { color: var(--color-muted-fg); }
+.adjust-note-cell { max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ============================================================
+   Usuários, login e perfis de acesso
+   ============================================================ */
+.user-area { display: flex; align-items: center; gap: .5rem; }
+
+.btn-login {
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  padding: .48rem 1.05rem;
+  border-radius: 999px;
+  background: var(--grad-primary, var(--color-primary));
+  color: #fff;
+  font-weight: 700;
+  font-size: .8rem;
+  box-shadow: 0 4px 12px rgba(77,141,246,.3);
+  transition: all .2s var(--ease-out);
+  border: none;
+}
+.btn-login:hover { transform: translateY(-1px); box-shadow: 0 8px 20px rgba(77,141,246,.4); }
+.btn-login svg { width: 15px; height: 15px; }
+
+.user-chip {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .28rem .7rem .28rem .3rem;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: var(--color-card);
+}
+.user-chip__avatar {
+  width: 28px; height: 28px;
+  border-radius: 999px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: .68rem; font-weight: 700;
+  flex-shrink: 0;
+}
+.user-chip__info { display: flex; flex-direction: column; line-height: 1.15; }
+.user-chip__name { font-size: .76rem; font-weight: 600; color: var(--color-fg); max-width: 140px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.user-chip__role { font-size: .62rem; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+
+.btn-logout {
+  display: flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .42rem .75rem;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  background: var(--color-card);
+  color: var(--color-muted-fg);
+  font-size: .74rem;
+  font-weight: 600;
+  transition: all .15s;
+}
+.btn-logout:hover { color: var(--color-error); border-color: rgba(239,68,68,.4); }
+.btn-logout svg { width: 14px; height: 14px; }
+
+/* Tela de login */
+.login-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  background: rgba(20, 25, 40, .45);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  animation: fadeIn .2s var(--ease-out);
+}
+.login-screen.hidden { display: none; }
+
+.login-card {
+  position: relative;
+  width: 100%;
+  max-width: 400px;
+  background: var(--color-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  padding: 2rem;
+  animation: fadeInUp .3s var(--ease-out);
+}
+.login-close { position: absolute; top: .8rem; right: .8rem; }
+
+.login-brand { text-align: center; margin-bottom: 1.4rem; }
+.login-brand .app-logo { margin: 0 auto .8rem; }
+.login-brand h2 { font-family: var(--font-heading); font-size: 1.2rem; font-weight: 700; margin: 0 0 .4rem; }
+.login-brand p { font-size: .82rem; color: var(--color-muted-fg); margin: 0; }
+
+.login-fields { display: flex; flex-direction: column; gap: .9rem; }
+.login-submit { width: 100%; margin-top: 1.2rem; padding: .75rem; font-size: .88rem; }
+.login-error {
+  margin: .9rem 0 0;
+  font-size: .78rem;
+  font-weight: 500;
+  color: var(--color-error);
+  background: rgba(239,68,68,.08);
+  border-radius: var(--radius-md);
+  padding: .55rem .8rem;
+}
+.login-hint { margin: .8rem 0 0; text-align: center; font-size: .74rem; color: var(--color-muted-fg); }
+.login-hint a { color: var(--color-primary); font-weight: 600; text-decoration: none; }
+.login-hint a:hover { text-decoration: underline; }
+.login-info {
+  margin: .9rem 0 0;
+  font-size: .78rem;
+  font-weight: 500;
+  color: var(--color-success);
+  background: rgba(16,185,129,.08);
+  border-radius: var(--radius-md);
+  padding: .55rem .8rem;
+}
+
+/* Minha Conta */
+.account-card { max-width: 440px; max-height: 92vh; overflow-y: auto; }
+.account-info {
+  display: flex;
+  flex-direction: column;
+  gap: .45rem;
+  background: var(--color-muted);
+  border-radius: var(--radius-md);
+  padding: .85rem 1rem;
+  font-size: .82rem;
+}
+.account-info > div { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.account-info__lbl { color: var(--color-muted-fg); font-weight: 500; font-size: .74rem; }
+.account-email-row { display: flex; gap: .5rem; }
+.account-email-row input { flex: 1; }
+.account-section-title {
+  font-family: var(--font-heading);
+  font-size: .92rem;
+  font-weight: 700;
+  margin: 1.3rem 0 .8rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--color-border);
+}
+
+/* Administração — senha/auditoria */
+.badge-reset-req { background: rgba(139,92,246,.12); color: #8B5CF6; margin-left: .35rem; }
+.audit-table td { font-size: .76rem; }
+.audit-cell { max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Administração */
+.admin-row-actions { display: flex; align-items: center; gap: .4rem; }
+.btn-toggle-user { padding: .3rem .7rem; font-size: .7rem; }
+.user-row--inactive td { opacity: .55; }
+
+@media (max-width: 768px) {
+  .adjust-form-grid { grid-template-columns: 1fr; }
+  .deadline-task-name { max-width: 160px; }
+  .user-chip__info { display: none; }
+  .user-chip { padding: .22rem; border: none; background: transparent; }
+  .btn-logout span { display: none; }
+  .btn-logout { padding: .42rem .5rem; }
+  .btn-login span { display: inline; }
+  .login-card { padding: 1.4rem; }
+}
