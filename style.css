@@ -1029,6 +1029,90 @@ svg { display: block; }
 .modal-task-item .progress-track { margin-top: .75rem; height: 8px; }
 
 /* ============================================================
+   Rastreamento da atividade (aba Comparação)
+   ============================================================ */
+.chart-click-hint {
+  margin: -.25rem 0 .5rem; font-size: .72rem; color: var(--color-muted-fg);
+  display: flex; align-items: center; gap: .3rem;
+}
+.chart-click-hint::before { content: '👆'; font-size: .78rem; }
+
+.deadline-row-click { cursor: pointer; transition: background .15s; }
+.deadline-row-click:hover { background: rgba(77,141,246,.07); }
+.deadline-row-click:hover .deadline-task-name { color: var(--color-primary); }
+
+.tt-section {
+  padding: 1rem 0 1.25rem; border-bottom: 1px solid var(--color-border);
+  animation: fadeInUp .3s var(--ease-out) both;
+}
+.tt-section:first-child { padding-top: 0; }
+.tt-section:last-child { border-bottom: none; }
+.tt-section h4 {
+  margin: 0 0 .75rem; font-size: .78rem; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .06em; color: var(--color-muted-fg);
+}
+
+.tt-status-banner {
+  display: flex; align-items: flex-start; gap: .85rem;
+  padding: .9rem 1rem; border: 1px solid; border-radius: var(--radius-md);
+}
+.tt-status-banner .badge-pill { flex-shrink: 0; margin-top: .1rem; }
+.tt-status-lines p { margin: 0; font-size: .84rem; line-height: 1.5; }
+.tt-status-explain { color: var(--color-muted-fg); font-size: .78rem !important; margin-top: .25rem !important; }
+
+.tt-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+  gap: .65rem .9rem;
+}
+.tt-field label {
+  display: block; font-size: .68rem; font-weight: 600; color: var(--color-muted-fg);
+  margin-bottom: .12rem;
+}
+.tt-value { font-size: .85rem; word-break: break-word; }
+.tt-na { color: var(--color-muted-fg); font-style: italic; font-size: .8rem; }
+
+.tt-src {
+  display: inline-block; padding: .08rem .45rem; border-radius: 999px;
+  font-size: .62rem; font-weight: 600; vertical-align: middle; margin-left: .25rem; white-space: nowrap;
+}
+.tt-src--excel { background: rgba(77,141,246,.12); color: var(--color-primary); }
+.tt-src--manual { background: rgba(249,115,22,.12); color: var(--color-warning); }
+
+.tt-timeline { position: relative; padding-left: .35rem; }
+.tt-tl-item { position: relative; display: flex; gap: .8rem; padding-bottom: 1rem; }
+.tt-tl-item:last-child { padding-bottom: 0; }
+.tt-tl-item::before {
+  content: ''; position: absolute; left: 5px; top: 14px; bottom: -2px;
+  width: 2px; background: var(--color-border);
+}
+.tt-tl-item:last-child::before { display: none; }
+.tt-tl-dot {
+  width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; margin-top: .2rem;
+  box-shadow: 0 0 0 3px rgba(0,0,0,.04); position: relative; z-index: 1;
+}
+.tt-tl-title { margin: 0; font-size: .84rem; font-weight: 600; }
+.tt-tl-date { margin: .08rem 0 0; font-size: .76rem; color: var(--color-muted-fg); }
+.tt-tl-detail { margin: .15rem 0 0; font-size: .74rem; color: var(--color-muted-fg); }
+
+.tt-note { margin: -.35rem 0 .75rem; font-size: .73rem; color: var(--color-muted-fg); }
+.tt-cmp-table th, .tt-cmp-table td { white-space: normal; }
+
+.tt-hist-item {
+  padding: .7rem .85rem; border: 1px solid var(--color-border); border-radius: var(--radius-md);
+  margin-bottom: .55rem; background: rgba(0,0,0,.012);
+}
+.tt-hist-item--audit { border-left: 3px solid var(--color-primary); }
+.tt-hist-head { margin: 0 0 .25rem; font-size: .78rem; color: var(--color-muted-fg); }
+.tt-hist-head strong { color: var(--color-fg); }
+.tt-hist-change { margin: .12rem 0 0; font-size: .82rem; }
+.tt-hist-note { margin: .3rem 0 0; font-size: .78rem; color: var(--color-muted-fg); font-style: italic; }
+.tt-audit-root { margin-top: .85rem; }
+.tt-audit-title {
+  margin: 0 0 .5rem; font-size: .72rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .05em; color: var(--color-muted-fg);
+}
+
+/* ============================================================
    Loading screen
    ============================================================ */
 .loading-screen {

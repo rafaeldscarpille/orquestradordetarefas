@@ -2638,6 +2638,7 @@
       <p class="section-subtitle" style="margin-bottom:1rem">
         Planner ativo: <strong>${escapeHtml(plannerName)}</strong> — atividades concluídas com datas de previsão e conclusão.
         ${hasAdjust ? 'Ajustes manuais da aba "Ajustes" já aplicados.' : ''}
+        Clique em uma atividade (no gráfico de desvios ou na tabela) para abrir o rastreamento completo.
       </p>
 
       <div class="kpi-grid">
@@ -2657,6 +2658,7 @@
         </div>
         <div class="chart-card">
           <h3>Maiores Desvios (dias)</h3>
+          <p class="chart-click-hint">Clique em uma barra para rastrear a atividade</p>
           <canvas id="chartDeadlineDeviation"></canvas>
         </div>
       </div>
@@ -2671,8 +2673,8 @@
               </tr>
             </thead>
             <tbody>
-              ${dl.rows.map(r => `
-                <tr>
+              ${dl.rows.map((r, i) => `
+                <tr class="deadline-row-click" data-deadline-row="${i}" title="Clique para ver o rastreamento completo">
                   <td class="deadline-task-name" title="${escapeHtml(r.task.name)}">
                     ${escapeHtml(r.task.name)}
                     ${r.task._adjusted ? '<span class="adjusted-tag" title="Datas complementadas manualmente na aba Ajustes">ajustada</span>' : ''}
@@ -2723,10 +2725,323 @@
       },
       options: {
         indexAxis: 'y', responsive: true, maintainAspectRatio: true,
-        plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => signedDays(ctx.parsed.x) } } },
+        onClick: (evt, els) => { if (els.length) openTaskTraceModal(topDev[els[0].index]); },
+        onHover: (evt, els) => {
+          const target = evt.native && evt.native.target;
+          if (target) target.style.cursor = els.length ? 'pointer' : 'default';
+        },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              title: items => topDev[items[0].dataIndex].task.name,
+              label: ctx => {
+                const r = topDev[ctx.dataIndex];
+                const perf = taskPerformance(r);
+                return [
+                  'Responsável: ' + ((r.task.assignees || []).join(', ') || 'Não disponível'),
+                  'Tempo estimado: ' + (r.estimated !== null ? r.estimated + 'd' : 'Não disponível'),
+                  'Tempo realizado: ' + (r.real !== null ? r.real + 'd' : 'Não disponível'),
+                  'Desvio: ' + signedDays(r.deviation),
+                  'Situação: ' + perf.label,
+                  '➜ Clique para ver o rastreamento completo',
+                ];
+              },
+            },
+          },
+        },
         scales: { x: { ticks: { callback: v => signedDays(v) } } },
       },
     });
+
+    // Linhas da tabela de prazos também abrem o rastreamento da atividade
+    document.querySelectorAll('[data-deadline-row]').forEach(tr => {
+      tr.onclick = () => {
+        const row = dl.rows[Number(tr.getAttribute('data-deadline-row'))];
+        if (row) openTaskTraceModal(row);
+      };
+    });
+  }
+
+  /* ============================================================
+     Rastreamento completo da atividade (aba Comparação)
+     — detalhe sob demanda, sem sair da aba nem perder filtros
+     ============================================================ */
+  function taskPerformance(row) {
+    if (!row.due || !row.done) {
+      if (row.task.statusGroup !== 'completed') return { label: 'Em andamento', color: COLORS.primary };
+      return { label: 'Dados insuficientes', color: COLORS.muted };
+    }
+    if (row.deviation < 0) return { label: 'Antecipada', color: COLORS.success };
+    if (row.deviation > 0) return { label: 'Atrasada', color: COLORS.error };
+    return { label: 'No prazo', color: COLORS.primary };
+  }
+
+  function traceDate(ds) {
+    const d = parseDate(ds);
+    return d ? d.toLocaleDateString('pt-BR') : null;
+  }
+
+  function traceDateTime(iso) {
+    if (!iso) return null;
+    const d = new Date(iso);
+    return isNaN(d.getTime()) ? null : d.toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  }
+
+  function traceVal(v) {
+    return (v === null || v === undefined || v === '') ? '<span class="tt-na">Não disponível</span>' : escapeHtml(String(v));
+  }
+
+  function traceField(label, valueHtml) {
+    return `<div class="tt-field"><label>${label}</label><div class="tt-value">${valueHtml}</div></div>`;
+  }
+
+  function traceSourceTag(manual) {
+    return manual
+      ? `<span class="tt-src tt-src--manual" title="Valor definido na aba Ajustes — o dado original do arquivo permanece preservado">Ajuste manual</span>`
+      : `<span class="tt-src tt-src--excel" title="Valor original importado do Planner/Excel">Planner/Excel</span>`;
+  }
+
+  function openTaskTraceModal(row) {
+    const task = row.task;
+    const planner = getActivePlanner();
+    const adj = planner ? ((planner.adjustments || []).find(a => a.id === task._adjustmentId) || findAdjustmentForTask(planner, task)) : null;
+    const orig = task._original || { start_date: task.start_date, due_date: task.due_date, completed_at: task.completed_at };
+    const perf = taskPerformance(row);
+
+    // Cabeçalho do modal (reaproveita a estrutura do modal de KPIs)
+    document.getElementById('modalIcon').innerHTML = ICONS.trendingUp;
+    document.getElementById('modalIcon').style.color = perf.color;
+    document.getElementById('modalTitle').textContent = task.name;
+    document.getElementById('modalDescription').textContent = `Rastreamento completo da atividade — Plano: ${planner ? planner.name : 'Não disponível'}`;
+
+    // ---- Status de desempenho ----
+    const explainParts = [];
+    if (row.estimated !== null) explainParts.push(`Tempo estimado: <strong>${row.estimated} dia${row.estimated === 1 ? '' : 's'}</strong>`);
+    if (row.real !== null) explainParts.push(`Tempo realizado: <strong>${row.real} dia${row.real === 1 ? '' : 's'}</strong>`);
+    if (row.deviation !== null && row.deviation !== undefined) explainParts.push(`Desvio: <strong>${signedDays(row.deviation)}</strong>`);
+    explainParts.push(`Resultado: <strong style="color:${perf.color}">${perf.label}</strong>`);
+    let explainText = '';
+    if (row.deviation < 0) explainText = `Concluída ${Math.abs(row.deviation)} dia${Math.abs(row.deviation) === 1 ? '' : 's'} antes da data prevista.`;
+    else if (row.deviation > 0) explainText = `Concluída ${row.deviation} dia${row.deviation === 1 ? '' : 's'} depois da data prevista.`;
+    else if (row.due && row.done) explainText = 'Concluída exatamente na data prevista.';
+
+    const statusHtml = `
+      <div class="tt-section" style="animation-delay:0ms">
+        <div class="tt-status-banner" style="border-color:${perf.color}55;background:${perf.color}0f">
+          <span class="badge-pill" style="background:${perf.color}">${perf.label}</span>
+          <div class="tt-status-lines">
+            <p>${explainParts.join(' &nbsp;·&nbsp; ')}</p>
+            ${explainText ? `<p class="tt-status-explain">${explainText}</p>` : ''}
+          </div>
+        </div>
+      </div>`;
+
+    // ---- Identificação ----
+    const idHtml = `
+      <div class="tt-section" style="animation-delay:40ms">
+        <h4>Identificação</h4>
+        <div class="tt-grid">
+          ${traceField('Atividade', traceVal(task.name))}
+          ${traceField('ID da atividade', traceVal(task.id))}
+          ${traceField('Plano', traceVal(planner ? planner.name : null))}
+          ${traceField('Projeto / Bucket / Lista', traceVal(task.category !== 'Sem categoria' ? task.category : null))}
+          ${traceField('Responsável', traceVal((task.assignees || []).join(', ') || null))}
+          ${traceField('Área / Equipe', traceVal(task.client || null))}
+          ${traceField('Tipo de tarefa', traceVal(task.taskType || null))}
+          ${traceField('Prioridade', traceVal(task.priority))}
+          ${traceField('Status', traceVal(task.status))}
+          ${traceField('Percentual de conclusão', `${Math.round(task.progress || 0)}%`)}
+        </div>
+      </div>`;
+
+    // ---- Datas (valores em uso na análise, com origem identificada) ----
+    const dateWithSrc = (ds, adjusted) => {
+      const v = traceDate(ds);
+      return v ? `${escapeHtml(v)} ${traceSourceTag(adjusted)}` : '<span class="tt-na">Não disponível</span>';
+    };
+    const lastUpdate = adj ? (adj.updatedAtIso || adj.createdAtIso) : null;
+    const datesHtml = `
+      <div class="tt-section" style="animation-delay:80ms">
+        <h4>Datas</h4>
+        <div class="tt-grid">
+          ${traceField('Data de criação', dateWithSrc(task.created_at, false))}
+          ${traceField('Data de início', dateWithSrc(task.start_date, !!(adj && adj.start_date)))}
+          ${traceField('Data prevista de conclusão', dateWithSrc(task.due_date, !!(adj && adj.due_date)))}
+          ${traceField('Data real de conclusão', dateWithSrc(task.completed_at, !!(adj && adj.completed_at)))}
+          ${traceField('Última atualização no sistema', traceVal(traceDateTime(lastUpdate)))}
+        </div>
+      </div>`;
+
+    // ---- Tempos ----
+    const timesHtml = `
+      <div class="tt-section" style="animation-delay:120ms">
+        <h4>Tempos</h4>
+        <div class="tt-grid">
+          ${traceField('Tempo estimado (previsão − início)', row.estimated !== null ? row.estimated + ' dia' + (row.estimated === 1 ? '' : 's') : '<span class="tt-na">Não disponível</span>')}
+          ${traceField('Tempo real de execução (conclusão − início)', row.real !== null ? row.real + ' dia' + (row.real === 1 ? '' : 's') : '<span class="tt-na">Não disponível</span>')}
+          ${traceField('Diferença estimado × realizado', `<strong style="color:${perf.color}">${signedDays(row.deviation)}</strong>`)}
+          ${traceField('Percentual de desvio', row.deviationPct !== null ? (row.deviationPct > 0 ? '+' : '') + row.deviationPct + '%' : '<span class="tt-na">Não disponível</span>')}
+          ${traceField(row.deviation < 0 ? 'Dias de antecipação' : 'Dias de atraso', row.deviation === 0 ? '0 (no prazo)' : Math.abs(row.deviation) + ' dia' + (Math.abs(row.deviation) === 1 ? '' : 's'))}
+        </div>
+      </div>`;
+
+    // ---- Linha do tempo ----
+    const tlItems = [
+      { title: 'Criada', date: traceDate(task.created_at), color: COLORS.muted, manual: false },
+      { title: 'Iniciada', date: traceDate(task.start_date), color: COLORS.primary, manual: !!(adj && adj.start_date) },
+      { title: 'Previsão de conclusão', date: traceDate(task.due_date), color: COLORS.warning, manual: !!(adj && adj.due_date) },
+      { title: 'Concluída', date: traceDate(task.completed_at), color: COLORS.success, manual: !!(adj && adj.completed_at) },
+    ];
+    const adjEvents = [];
+    if (adj) {
+      const FIELD_LABELS = { start_date: 'Data de início', due_date: 'Data prevista', completed_at: 'Data de conclusão' };
+      const changed = Object.keys(FIELD_LABELS).filter(k => adj[k]);
+      adjEvents.push({
+        title: 'Ajuste realizado',
+        date: traceDateTime(adj.createdAtIso) || traceDate(adj.adjustedAt),
+        color: COLORS.warning,
+        manual: true,
+        detail: `Campo(s): ${changed.map(k => FIELD_LABELS[k]).join(', ') || '—'} · Usuário: ${escapeHtml(adj.createdByName || adj.responsible || 'Não disponível')}`,
+      });
+      if (adj.updatedAtIso && adj.updatedAtIso !== adj.createdAtIso) {
+        adjEvents.push({
+          title: 'Ajuste atualizado',
+          date: traceDateTime(adj.updatedAtIso),
+          color: COLORS.warning,
+          manual: true,
+          detail: `Usuário: ${escapeHtml(adj.updatedByName || 'Não disponível')}`,
+        });
+      }
+    }
+    const timelineHtml = `
+      <div class="tt-section" style="animation-delay:160ms">
+        <h4>Linha do tempo</h4>
+        <div class="tt-timeline">
+          ${tlItems.concat(adjEvents).map(it => `
+            <div class="tt-tl-item">
+              <span class="tt-tl-dot" style="background:${it.date ? it.color : 'var(--color-muted)'}"></span>
+              <div class="tt-tl-body">
+                <p class="tt-tl-title">${it.title} ${it.manual ? traceSourceTag(true) : ''}</p>
+                <p class="tt-tl-date">${it.date ? escapeHtml(it.date) : 'Não disponível'}</p>
+                ${it.detail ? `<p class="tt-tl-detail">${it.detail}</p>` : ''}
+              </div>
+            </div>`).join('')}
+        </div>
+      </div>`;
+
+    // ---- Dados originais × dados ajustados (auditoria — original nunca é sobrescrito) ----
+    let originalsHtml = '';
+    if (task._adjusted && adj) {
+      const cmpRow = (label, origVal, adjVal) => `
+        <tr>
+          <td>${label}</td>
+          <td>${traceDate(origVal) ? escapeHtml(traceDate(origVal)) : '<span class="tt-na">Não disponível</span>'}</td>
+          <td>${adjVal
+            ? `<strong>${escapeHtml(traceDate(adjVal) || adjVal)}</strong> ${traceSourceTag(true)}`
+            : `${traceDate(origVal) ? escapeHtml(traceDate(origVal)) : '<span class="tt-na">Não disponível</span>'} ${traceSourceTag(false)}`}</td>
+        </tr>`;
+      originalsHtml = `
+        <div class="tt-section" style="animation-delay:200ms">
+          <h4>Dados originais × dados ajustados</h4>
+          <p class="tt-note">O dado original do Planner/Excel é sempre preservado — o ajuste manual apenas se sobrepõe nas análises.</p>
+          <div class="table-scroll">
+            <table class="compare-table tt-cmp-table">
+              <thead><tr><th>Campo</th><th>Original (Planner/Excel)</th><th>Em uso na análise</th></tr></thead>
+              <tbody>
+                ${cmpRow('Início', orig.start_date, adj.start_date)}
+                ${cmpRow('Previsão', orig.due_date, adj.due_date)}
+                ${cmpRow('Conclusão', orig.completed_at, adj.completed_at)}
+              </tbody>
+            </table>
+          </div>
+        </div>`;
+    }
+
+    // ---- Histórico de alterações (registro do ajuste + trilha de auditoria) ----
+    let historyItems = '';
+    if (adj) {
+      const FIELD_LABELS = { start_date: 'Data de início', due_date: 'Data prevista', completed_at: 'Data de conclusão' };
+      const changes = Object.keys(FIELD_LABELS).filter(k => adj[k]).map(k => `
+        <p class="tt-hist-change">${FIELD_LABELS[k]} alterada — De: <strong>${traceDate(orig[k]) || 'Não disponível'}</strong> · Para: <strong>${traceDate(adj[k]) || escapeHtml(adj[k])}</strong></p>`).join('');
+      historyItems = `
+        <div class="tt-hist-item">
+          <p class="tt-hist-head">${traceDateTime(adj.createdAtIso) || traceDate(adj.adjustedAt) || 'Data não disponível'} — <strong>${escapeHtml(adj.createdByName || adj.responsible || 'Não disponível')}</strong></p>
+          ${changes}
+          ${adj.note ? `<p class="tt-hist-note">Observação: ${escapeHtml(adj.note)}</p>` : ''}
+        </div>
+        ${adj.updatedAtIso && adj.updatedAtIso !== adj.createdAtIso ? `
+        <div class="tt-hist-item">
+          <p class="tt-hist-head">${traceDateTime(adj.updatedAtIso)} — <strong>${escapeHtml(adj.updatedByName || 'Não disponível')}</strong></p>
+          <p class="tt-hist-change">Ajuste atualizado (valores acima refletem a versão vigente).</p>
+        </div>` : ''}`;
+    } else {
+      historyItems = '<p class="tt-na" style="padding:.25rem 0">Nenhum ajuste manual registrado — a análise usa somente os dados originais do Planner/Excel.</p>';
+    }
+    const historyHtml = `
+      <div class="tt-section" style="animation-delay:240ms">
+        <h4>Histórico da atividade</h4>
+        ${historyItems}
+        <div id="ttAuditRoot" class="tt-audit-root"><p class="tt-na">Carregando trilha de auditoria do sistema…</p></div>
+      </div>`;
+
+    // ---- Rastreabilidade do responsável ----
+    const traceRespHtml = `
+      <div class="tt-section" style="animation-delay:280ms">
+        <h4>Rastreabilidade do responsável</h4>
+        <div class="tt-grid">
+          ${traceField('Responsável pela atividade', traceVal((task.assignees || [])[0] || null))}
+          ${traceField('Participantes', traceVal((task.assignees || []).length > 1 ? task.assignees.join(', ') : ((task.assignees || []).length === 1 ? task.assignees[0] : null)))}
+          ${traceField('Área / Equipe', traceVal(task.client || null))}
+          ${traceField('Quem iniciou', traceVal(null))}
+          ${traceField('Quem concluiu', traceVal(null))}
+          ${traceField('Quem registrou ajustes no sistema', traceVal(adj ? (adj.createdByName || adj.responsible || null) : null))}
+          ${traceField('Última alteração por', traceVal(adj ? (adj.updatedByName || null) : null))}
+        </div>
+        <p class="tt-note">Informações exibidas somente quando presentes no Planner/Excel ou registradas no sistema — nenhum valor é inventado.</p>
+      </div>`;
+
+    document.getElementById('modalBody').innerHTML =
+      statusHtml + idHtml + datesHtml + timesHtml + timelineHtml + originalsHtml + historyHtml + traceRespHtml;
+
+    document.getElementById('modalOverlay').classList.add('open');
+    document.getElementById('modalPanel').classList.add('open');
+
+    loadTaskTraceAudit(task.name);
+  }
+
+  // Trilha de auditoria da atividade — carregada sob demanda ao abrir o detalhe
+  async function loadTaskTraceAudit(taskName) {
+    const root = document.getElementById('ttAuditRoot');
+    if (!root) return;
+    if (!cloud.db) {
+      root.innerHTML = '<p class="tt-na">Trilha de auditoria disponível apenas com a nuvem conectada.</p>';
+      return;
+    }
+    try {
+      const snap = await cloud.db.collection('audit').where('target', '==', String(taskName)).limit(30).get();
+      const el = document.getElementById('ttAuditRoot');
+      if (!el) return; // modal fechado/re-renderizado enquanto carregava
+      const entries = snap.docs.map(d => d.data())
+        .filter(a => /ajuste/i.test(a.action || ''))
+        .sort((a, b) => String(b.atIso || '').localeCompare(String(a.atIso || '')));
+      if (!entries.length) {
+        el.innerHTML = '<p class="tt-na">Nenhum registro desta atividade na trilha de auditoria do sistema.</p>';
+        return;
+      }
+      el.innerHTML = `
+        <p class="tt-audit-title">Trilha de auditoria do sistema (somente leitura)</p>
+        ${entries.map(a => `
+          <div class="tt-hist-item tt-hist-item--audit">
+            <p class="tt-hist-head">${a.atIso ? new Date(a.atIso).toLocaleString('pt-BR') : 'Data não disponível'} — <strong>${escapeHtml(a.fullName || a.username || 'Não disponível')}</strong> · ${escapeHtml(a.action || '')}</p>
+            ${a.before ? `<p class="tt-hist-change">De: ${escapeHtml(a.before)}</p>` : ''}
+            ${a.after ? `<p class="tt-hist-change">Para: ${escapeHtml(a.after)}</p>` : ''}
+          </div>`).join('')}`;
+    } catch (e) {
+      console.warn('Falha ao carregar trilha de auditoria da atividade.', e);
+      const el = document.getElementById('ttAuditRoot');
+      if (el) el.innerHTML = '<p class="tt-na">Não foi possível carregar a trilha de auditoria.</p>';
+    }
   }
 
   function renderCompareTab() {
